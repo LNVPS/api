@@ -102,13 +102,7 @@ mod tests {
     #[test]
     fn two_signals_do_not_alert() {
         let now = Utc::now();
-        let s = order_signals(
-            now - Duration::hours(2),
-            now,
-            32,
-            32 * GIB,
-            "me@example.org",
-        );
+        let s = order_signals(now - Duration::hours(2), now, 32, 32 * GIB, "me@example.org");
         assert!(!should_alert(&s));
         let s = order_signals(now - Duration::days(400), now, 32, 32 * GIB, "a@mail.tm");
         assert!(!should_alert(&s));

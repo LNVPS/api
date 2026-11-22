@@ -76,16 +76,9 @@ impl VmHistoryLogger {
     async fn store(&self, history: &VmHistory) -> Result<u64> {
         let id = self.db.insert_vm_history(history).await?;
         let entry = lnvps_db::NewAuditEntry::new(
-            if history.initiated_by_user.is_some() {
-                "user"
-            } else {
-                "system"
-            },
+            if history.initiated_by_user.is_some() { "user" } else { "system" },
             history.initiated_by_user,
-            &format!(
-                "vm.history.{}",
-                history.action_type.to_string().to_lowercase()
-            ),
+            &format!("vm.history.{}", history.action_type.to_string().to_lowercase()),
         )
         .target("vm", history.vm_id);
         if let Err(e) = crate::record_audit(self.db.as_ref(), entry).await {

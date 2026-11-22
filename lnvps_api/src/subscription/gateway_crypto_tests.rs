@@ -231,6 +231,7 @@ async fn gateway_paid_event_settles_an_onchain_payment_once() {
         kind: "payment.paid".into(),
         reference: hex::encode(&payment.id),
         status: "paid".into(),
+        ..Default::default()
     };
     assert_eq!(
         handle_gateway_event(&db, &f.sub, &event).await.unwrap(),
@@ -252,12 +253,7 @@ async fn gateway_paid_event_settles_an_onchain_payment_once() {
 async fn credit_topups_take_address_and_swap_from_the_gateway() {
     let f = fixture().await;
     let reference = [9u8; 32];
-    let mut onchain_config = f
-        .db
-        .list_payment_method_configs()
-        .await
-        .unwrap()
-        .remove(0);
+    let mut onchain_config = f.db.list_payment_method_configs().await.unwrap().remove(0);
     onchain_config.id = 0;
     onchain_config.payment_method = PaymentMethod::OnChain;
     f.db.insert_payment_method_config(&onchain_config)
@@ -286,6 +282,101 @@ async fn credit_topups_take_address_and_swap_from_the_gateway() {
 }
 
 #[tokio::test]
+async fn gateway_paid_event_settles_a_fixedfloat_swap_once_and_unpaid_swaps_stay_unpaid() {
+    let f = fixture().await;
+    let payment = f
+        .sub
+        .renew_subscription_with_mode(
+            f.sub_id,
+            PaymentMethod::FixedFloat,
+            1,
+            RenewMode::FixedFloat {
+                coin: Currency::XMR,
+            },
+        )
+        .await
+        .unwrap();
+    let db: Arc<dyn LNVpsDb> = f.db.clone();
+    let reference = hex::encode(&payment.id);
+
+    let underpaid = GatewayEvent {
+        event_id: "u1".into(),
+        kind: "attempt.failed".into(),
+        reference: reference.clone(),
+        status: "pending".into(),
+        reason: Some("underpaid".into()),
+        ..Default::default()
+    };
+    handle_gateway_event(&db, &f.sub, &underpaid).await.unwrap();
+    assert!(
+        !f.db
+            .get_subscription_payment(&payment.id)
+            .await
+            .unwrap()
+            .is_paid
+    );
+
+    let fresh = f
+        .sub
+        .renew_subscription_with_mode(
+            f.sub_id,
+            PaymentMethod::FixedFloat,
+            1,
+            RenewMode::FixedFloat {
+                coin: Currency::XMR,
+            },
+        )
+        .await
+        .unwrap();
+    let paid = GatewayEvent {
+        event_id: "p1".into(),
+        kind: "payment.paid".into(),
+        reference: hex::encode(&fresh.id),
+        status: "paid".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        handle_gateway_event(&db, &f.sub, &paid).await.unwrap(),
+        GatewayEventOutcome::Settled
+    );
+    let expiry = f.db.get_subscription(f.sub_id).await.unwrap().expires;
+    assert_eq!(
+        handle_gateway_event(&db, &f.sub, &paid).await.unwrap(),
+        GatewayEventOutcome::AlreadySettled
+    );
+    assert_eq!(
+        f.db.get_subscription(f.sub_id).await.unwrap().expires,
+        expiry
+    );
+}
+
+#[tokio::test]
+async fn the_node_watcher_ignores_a_deposit_to_a_gateway_address() {
+    let f = fixture().await;
+    let payment = f
+        .sub
+        .renew_subscription(f.sub_id, PaymentMethod::OnChain, 1)
+        .await
+        .unwrap();
+    let handler = crate::payments::onchain::OnChainPaymentHandler::new(
+        f.onchain.clone(),
+        f.db.clone(),
+        f.sub.clone(),
+    );
+    handler
+        .handle_deposit(payment.external_data.as_str(), "tx1", 0, 5_000_000)
+        .await
+        .unwrap();
+    assert!(
+        !f.db
+            .get_subscription_payment(&payment.id)
+            .await
+            .unwrap()
+            .is_paid
+    );
+}
+
+#[tokio::test]
 async fn gateway_paid_event_settles_a_credit_topup_once() {
     let f = fixture().await;
     let reference = [7u8; 32];
@@ -307,6 +398,7 @@ async fn gateway_paid_event_settles_a_credit_topup_once() {
         kind: "payment.paid".into(),
         reference: hex::encode(reference),
         status: "paid".into(),
+        ..Default::default()
     };
     assert_eq!(
         handle_gateway_event(&db, &f.sub, &event).await.unwrap(),

@@ -621,7 +621,7 @@ impl OnChainPaymentHandler {
     }
 
     /// Handle a confirmed deposit of `amount_msat` to `address` in tx `txid`.
-    async fn handle_deposit(
+    pub(crate) async fn handle_deposit(
         &self,
         address: &str,
         txid: &str,

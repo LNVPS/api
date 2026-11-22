@@ -88,7 +88,7 @@ impl VmRefundHandler {
                 }
             };
             let gateway_ref = format!("pgw-refund:{}", refund.id);
-            let row = build_refund_row(
+            let mut row = build_refund_row(
                 &original,
                 amount,
                 refunded_at,
@@ -99,6 +99,7 @@ impl VmRefundHandler {
                     instrument: destination,
                 },
             );
+            row.id = crate::payments::gateway::gateway_refund_row_id(&original.id, refund.id);
             if let Err(e) = self.db.insert_subscription_payment(&row).await {
                 error!(
                     "PAID BUT UNRECORDED: gateway refund {} of {} {} against payment {} for VM {} \
@@ -327,6 +328,88 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn a_refund_completed_event_after_the_payout_is_not_booked_twice() {
+        use crate::payments::gateway::{GatewayEventOutcome, handle_gateway_event};
+        use lnvps_api_common::GatewayEvent;
+        let mock = MockDb::default();
+        let (_vm, payment) = vm_with_payment(&mock, 1230, 230).await;
+        gateway_payment(&mock, &payment, PaymentMethod::FixedFloat).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let fake = Arc::new(FakeGateway::default());
+        let handler = handler(db.clone(), Arc::new(PayNode::default()))
+            .await
+            .with_gateway(Some(fake.clone()));
+        let outcome = handler
+            .process_gateway(1, 9, None, None, None)
+            .await
+            .unwrap();
+
+        let sub = crate::subscription::SubscriptionHandler::new(
+            crate::settings::mock_settings(),
+            db.clone(),
+            Arc::new(PayNode::default()),
+            Arc::new(crate::mocks::MockOnChainProvider::default()),
+            None,
+            Arc::new(lnvps_api_common::MockExchangeRate::default()),
+            lnvps_api_common::VatClient::new(),
+            Arc::new(lnvps_api_common::ChannelWorkCommander::new()),
+            lnvps_api_common::VmStateCache::new(),
+        )
+        .unwrap();
+        let event = GatewayEvent {
+            event_id: "r1".into(),
+            kind: "refund.completed".into(),
+            reference: hex::encode(&payment.id),
+            status: "refunded".into(),
+            refund_id: Some(1),
+            amount: Some(outcome.booked_amount),
+            reason: None,
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                handle_gateway_event(&db, &sub, &event).await.unwrap(),
+                GatewayEventOutcome::Ignored
+            );
+        }
+        assert_eq!(
+            db.list_refunds_for_payment(&payment.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_refund_cannot_exceed_what_is_left() {
+        let mock = MockDb::default();
+        let (_vm, payment) = vm_with_payment(&mock, 1230, 230).await;
+        gateway_payment(&mock, &payment, PaymentMethod::OnChain).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let fake = Arc::new(FakeGateway::default());
+        let handler = handler(db.clone(), Arc::new(PayNode::default()))
+            .await
+            .with_gateway(Some(fake.clone()));
+        let first = handler
+            .process_gateway(1, 9, None, None, None)
+            .await
+            .unwrap();
+        let second = handler.process_gateway(1, 9, None, None, None).await;
+        let booked: u64 = db
+            .list_refunds_for_payment(&payment.id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.amount + r.tax)
+            .sum();
+        assert!(booked <= payment.amount + payment.tax, "{booked}");
+        assert!(first.booked_amount > 0);
+        if let Ok(s) = second {
+            assert!(s.booked_amount + first.booked_amount <= payment.amount + payment.tax);
+        }
     }
 
     #[tokio::test]

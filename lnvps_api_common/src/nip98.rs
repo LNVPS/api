@@ -57,10 +57,7 @@ pub enum AuthKind {
     /// Session JWT issued after an external (OAuth/OIDC) login. The identity is
     /// a synthetic `oauth_pubkey`, NOT a real Nostr key.
     Session(SessionClaims),
-    ApiToken {
-        token_id: u64,
-        scope: TokenScope,
-    },
+    ApiToken { token_id: u64, scope: TokenScope },
 }
 
 /// Request authentication.
@@ -455,7 +452,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(auth.auth_method(), "api_token");
-        let stored = db.get_api_token_by_hash(&row.token_hash).await.unwrap();
+        let stored = db
+            .get_api_token_by_hash(&row.token_hash)
+            .await
+            .unwrap();
         assert_eq!(stored.last_ip.as_deref(), Some("203.0.113.5"));
         assert!(stored.last_used.is_some());
     }

@@ -36,7 +36,10 @@ impl MailSink for MailSinkMock {
     }
 }
 
-async fn stack(sink: Arc<MailSinkMock>, email: &str) -> (DbToolExecutor, Arc<MockDb>, Arc<MockDb>) {
+async fn stack(
+    sink: Arc<MailSinkMock>,
+    email: &str,
+) -> (DbToolExecutor, Arc<MockDb>, Arc<MockDb>) {
     let db = Arc::new(MockDb::default());
     db.users.lock().await.insert(
         1,
@@ -96,10 +99,7 @@ async fn refused_without_a_user_id() {
 async fn sends_one_mail_with_reply_to_reference_and_history() {
     let sink = Arc::new(MailSinkMock::default());
     let (exec, db, _) = stack(sink.clone(), "bob@example.com").await;
-    let conv = db
-        .upsert_agent_conversation("user:1", Some(1))
-        .await
-        .unwrap();
+    let conv = db.upsert_agent_conversation("user:1", Some(1)).await.unwrap();
     db.append_agent_messages(
         conv.id,
         &[NewAgentMessage {
@@ -200,10 +200,7 @@ async fn a_failed_send_is_reported_and_not_recorded() {
     let err = exec.execute("escalate_to_support", ARGS).await.unwrap_err();
     assert!(err.to_string().contains("was not sent"));
     assert!(!err.to_string().contains("smtp down"));
-    let conv = db
-        .upsert_agent_conversation("user:1", Some(1))
-        .await
-        .unwrap();
+    let conv = db.upsert_agent_conversation("user:1", Some(1)).await.unwrap();
     assert_eq!(conv.escalation_count, 0);
 }
 
@@ -240,24 +237,22 @@ fn sse_response(chunks: Vec<String>) -> ResponseTemplate {
 async fn replay_disabled_vm_is_handed_to_support_by_the_tool_conv_763() {
     let server = MockServer::start().await;
     let call = |id: &str, name: &str, args: &str| {
-        sse(
-            serde_json::json!({"tool_calls": [{"index": 0, "id": id, "type": "function",
-            "function": {"name": name, "arguments": args}}]}),
-        )
+        sse(serde_json::json!({"tool_calls": [{"index": 0, "id": id, "type": "function",
+            "function": {"name": name, "arguments": args}}]}))
     };
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(sse_response(vec![call(
-            "c1",
-            "restart_vm",
-            r#"{"vm_id":7}"#,
-        )]))
+        .respond_with(sse_response(vec![call("c1", "restart_vm", r#"{"vm_id":7}"#)]))
         .up_to_n_times(1)
         .mount(&server)
         .await;
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))
-        .respond_with(sse_response(vec![call("c2", "escalate_to_support", ARGS)]))
+        .respond_with(sse_response(vec![call(
+            "c2",
+            "escalate_to_support",
+            ARGS,
+        )]))
         .up_to_n_times(1)
         .mount(&server)
         .await;
@@ -299,10 +294,7 @@ async fn replay_disabled_vm_is_handed_to_support_by_the_tool_conv_763() {
         },
         Arc::new(exec),
     );
-    let events = session
-        .send("my VM 7 will not start")
-        .collect::<Vec<_>>()
-        .await;
+    let events = session.send("my VM 7 will not start").collect::<Vec<_>>().await;
     match events.last().unwrap() {
         ChatEvent::Final { text } => assert!(text.contains("support-1")),
         other => panic!("{other:?}"),
@@ -311,10 +303,7 @@ async fn replay_disabled_vm_is_handed_to_support_by_the_tool_conv_763() {
     let sent = sink.sent.lock().await;
     assert_eq!(sent.len(), 1);
     assert_eq!(sent[0].reply_to, "bob@example.com");
-    println!(
-        "AFTER escalation mail:\n{}\n{}",
-        sent[0].subject, sent[0].body
-    );
+    println!("AFTER escalation mail:\n{}\n{}", sent[0].subject, sent[0].body);
 
     let requests = server.received_requests().await.unwrap();
     let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();

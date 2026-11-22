@@ -9,17 +9,19 @@ use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbMysql};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+const CONFIRM_ENV: &str = "GATEWAY_IMPORT_CONFIRM";
+
 #[derive(Parser)]
 #[clap(about = "Import payment_method_config rows as providers of the LNVPS gateway project")]
 struct Args {
     #[clap(short, long)]
     config: Vec<PathBuf>,
 
-    #[clap(long, env = "GATEWAY_URL")]
+    #[clap(long)]
     gateway_url: Option<String>,
 
-    #[clap(long, env = "GATEWAY_ADMIN_TOKEN", hide_env_values = true)]
-    admin_token: String,
+    #[clap(long)]
+    admin_token: Option<String>,
 
     #[clap(long)]
     tenant: u64,
@@ -35,6 +37,18 @@ struct Args {
 async fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
+    if args.apply && std::env::var(CONFIRM_ENV).as_deref() != Ok("yes") {
+        anyhow::bail!("--apply refused: set {CONFIRM_ENV}=yes to confirm creating providers");
+    }
+    let admin_token = args
+        .admin_token
+        .clone()
+        .or_else(|| std::env::var("GATEWAY_ADMIN_TOKEN").ok())
+        .context("pass --admin-token or set GATEWAY_ADMIN_TOKEN")?;
+    let args_gateway_url = args
+        .gateway_url
+        .clone()
+        .or_else(|| std::env::var("GATEWAY_URL").ok());
 
     let settings: Settings = {
         let mut builder = Config::builder();
@@ -57,13 +71,12 @@ async fn main() -> Result<()> {
         )?;
     }
 
-    let gateway_url = args
-        .gateway_url
+    let gateway_url = args_gateway_url
         .or_else(|| settings.gateway.as_ref().map(|g| g.url.clone()))
         .context("pass --gateway-url or set the gateway section in the config")?;
 
     let db: Arc<dyn LNVpsDb> = Arc::new(LNVpsDbMysql::new(&settings.db).await?);
-    let admin = HttpGatewayAdmin::new(&gateway_url, &args.admin_token);
+    let admin = HttpGatewayAdmin::new(&gateway_url, &admin_token);
     let report = import_providers(
         &db,
         &admin,

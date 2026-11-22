@@ -17,7 +17,7 @@ use tokio::time::sleep;
 
 pub mod gateway;
 pub(crate) mod invoice;
-mod onchain;
+pub(crate) mod onchain;
 #[cfg(feature = "revolut")]
 mod revolut;
 #[cfg(feature = "stripe")]
@@ -35,6 +35,19 @@ pub async fn listen_all_payments(
     sub_handler: SubscriptionHandler,
 ) -> Result<Vec<JoinHandle<()>>> {
     let mut ret = Vec::new();
+    if settings.gateway.is_some() {
+        let (sweep_db, sweep_sub) = (db.clone(), sub_handler.clone());
+        ret.push(tokio::spawn(async move {
+            loop {
+                if let Err(e) =
+                    gateway::cancel_expired_gateway_payments(&sweep_db, &sweep_sub).await
+                {
+                    error!("gateway-expiry-error: {}", e);
+                }
+                sleep(Duration::from_secs(60)).await;
+            }
+        }));
+    }
     let mut handler = NodeInvoiceHandler::new(node.clone(), db.clone(), sub_handler.clone());
     ret.push(tokio::spawn(async move {
         loop {

@@ -21,7 +21,7 @@ use lnvps_api_common::{
     WorkCommander, round_msat_to_sat,
 };
 use lnvps_api_common::{
-    GatewayCryptoRequest, GatewayInvoice, GatewayInvoiceRequest, PaymentGateway,
+    GatewayCryptoRequest, GatewayInvoice, GatewayInvoiceRequest, OffSessionRenewals, PaymentGateway,
 };
 use lnvps_db::{
     LNVpsDb, LineItemType, PaymentMethod, RenewalSource, Subscription, SubscriptionLineItem,
@@ -43,6 +43,7 @@ use crypto::{CryptoContext, ONCHAIN_EXPIRE_SECS, SWAP_EXPIRE_SECS};
 
 mod app;
 mod crypto;
+mod gateway_card;
 #[cfg(test)]
 mod gateway_crypto_tests;
 mod ip_range;
@@ -283,6 +284,16 @@ const SAVED_PAYMENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// returning it as still-pending.
 const SAVED_PAYMENT_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
+struct LightningInvoiceSpec {
+    subscription_id: u64,
+    user_id: u64,
+    payment_type: SubscriptionPaymentType,
+    amount_msat: u64,
+    tax_msat: u64,
+    description: String,
+    expires_in_secs: u32,
+}
+
 #[derive(Clone)]
 pub struct SubscriptionHandler {
     db: Arc<dyn LNVpsDb>,
@@ -291,6 +302,7 @@ pub struct SubscriptionHandler {
     node: Arc<dyn LightningNode>,
     lightning_gateway: Arc<dyn PaymentGateway>,
     card_gateway: Option<Arc<dyn PaymentGateway>>,
+    off_session: OffSessionRenewals,
     onchain: Arc<dyn OnChainProvider>,
     onchain_gateway: Option<Arc<dyn PaymentGateway>>,
     swap_gateway: Option<Arc<dyn PaymentGateway>>,
@@ -328,6 +340,7 @@ impl SubscriptionHandler {
             onchain_gateway: None,
             swap_gateway: None,
             card_gateway: None,
+            off_session: OffSessionRenewals::Off,
             lightning_gateway: Arc::new(crate::payments::gateway::InProcessGateway::new(
                 node.clone(),
             )),
@@ -580,6 +593,11 @@ impl SubscriptionHandler {
         self
     }
 
+    pub fn with_off_session_renewals(mut self, mode: OffSessionRenewals) -> Self {
+        self.off_session = mode;
+        self
+    }
+
     pub fn with_lightning_gateway(mut self, gateway: Arc<dyn PaymentGateway>) -> Self {
         self.lightning_gateway = gateway;
         self
@@ -601,28 +619,20 @@ impl SubscriptionHandler {
             .or_else(|| self.onchain_gateway.clone())
             .or_else(|| self.swap_gateway.clone())
     }
-    async fn new_lightning_invoice(
-        &self,
-        subscription_id: u64,
-        user_id: u64,
-        payment_type: SubscriptionPaymentType,
-        amount_msat: u64,
-        tax_msat: u64,
-        description: String,
-        expires_in_secs: u32,
-    ) -> Result<GatewayInvoice> {
+
+    async fn new_lightning_invoice(&self, spec: LightningInvoiceSpec) -> Result<GatewayInvoice> {
         let payment_id: [u8; 32] = rand::random();
         self.lightning_gateway
             .create_lightning_invoice(GatewayInvoiceRequest {
                 payment_id: payment_id.to_vec(),
-                amount_msat,
-                tax_msat,
-                description,
-                expires_in_secs,
-                customer_ref: user_id.to_string(),
+                amount_msat: spec.amount_msat,
+                tax_msat: spec.tax_msat,
+                description: spec.description,
+                expires_in_secs: spec.expires_in_secs,
+                customer_ref: spec.user_id.to_string(),
                 metadata: serde_json::json!({
-                    "subscription_id": subscription_id,
-                    "payment_type": format!("{payment_type:?}"),
+                    "subscription_id": spec.subscription_id,
+                    "payment_type": format!("{:?}", spec.payment_type),
                 }),
             })
             .await
@@ -1600,6 +1610,71 @@ impl SubscriptionHandler {
             });
         }
         let credit_covered = credit_amount(credit);
+        if self.wants_gateway_saved(method, mode)
+            && let Some(saved) = self
+                .gateway_saved_method(
+                    user.id,
+                    method,
+                    match mode {
+                        RenewMode::Saved { method_id } => *method_id,
+                        _ => None,
+                    },
+                )
+                .await?
+        {
+            ensure!(
+                converted_currency != Currency::BTC,
+                "Cannot charge a card in BTC"
+            );
+            let description = format!("Subscription {payment_type:?}: {}", subscription.name);
+            ensure!(
+                payment_type != SubscriptionPaymentType::Refund,
+                "Cannot create an invoice for a refund"
+            );
+            let charge = self
+                .charge_gateway_saved_method(
+                    &saved,
+                    subscription_id,
+                    subscription.user_id,
+                    payment_type,
+                    converted_amount + tax + processing_fee - credit_covered,
+                    tax,
+                    &converted_currency.to_string(),
+                    description,
+                )
+                .await?;
+            return Ok(SubscriptionPayment {
+                renewal_source: Some(source),
+                id: charge.payment_id,
+                subscription_id,
+                user_id: subscription.user_id,
+                created: Utc::now(),
+                expires: Utc::now().add(Duration::from_secs(3600)),
+                amount: converted_amount,
+                currency: converted_currency.to_string(),
+                payment_method: method,
+                payment_type,
+                external_data: gateway_card::GATEWAY_CARD_EXTERNAL_DATA.into(),
+                external_id: Some(charge.external_id),
+                is_paid: false,
+                rate,
+                time_value: if time_value > 0 {
+                    Some(time_value)
+                } else {
+                    None
+                },
+                metadata: None,
+                tax,
+                processing_fee,
+                paid_at: None,
+                tax_rate: tax_summary.rate,
+                tax_country_code: tax_summary.country_code.clone(),
+                tax_treatment: tax_summary.treatment.clone(),
+                tax_evidence,
+                tax_breakdown,
+                refunded_payment_id: None,
+            });
+        }
         Ok(match method {
             PaymentMethod::Lightning => {
                 ensure!(
@@ -1638,15 +1713,15 @@ impl SubscriptionHandler {
                 );
 
                 let invoice = self
-                    .new_lightning_invoice(
+                    .new_lightning_invoice(LightningInvoiceSpec {
                         subscription_id,
-                        subscription.user_id,
+                        user_id: subscription.user_id,
                         payment_type,
-                        invoice_amount,
-                        tax,
-                        desc,
-                        INVOICE_EXPIRE as u32,
-                    )
+                        amount_msat: invoice_amount,
+                        tax_msat: tax,
+                        description: desc,
+                        expires_in_secs: INVOICE_EXPIRE as u32,
+                    })
                     .await?;
 
                 SubscriptionPayment {
@@ -2415,15 +2490,15 @@ impl SubscriptionHandler {
                     credit_covered / 1000
                 );
                 let invoice = self
-                    .new_lightning_invoice(
+                    .new_lightning_invoice(LightningInvoiceSpec {
                         subscription_id,
                         user_id,
                         payment_type,
-                        total_amount,
-                        p.tax,
-                        desc,
-                        INVOICE_EXPIRE as u32,
-                    )
+                        amount_msat: total_amount,
+                        tax_msat: p.tax,
+                        description: desc,
+                        expires_in_secs: INVOICE_EXPIRE as u32,
+                    })
                     .await?;
                 SubscriptionPayment {
                     // Every caller here is a customer action (renew, upgrade, purchase);
@@ -2734,6 +2809,14 @@ impl SubscriptionHandler {
                 {
                     bail!("NWC auto-renewal is not supported by this build")
                 }
+            }
+            "revolut" if self.holds_gateway_method(&method) => {
+                self.auto_renew_via_gateway_card(sub_id, PaymentMethod::Revolut)
+                    .await
+            }
+            "stripe" if self.holds_gateway_method(&method) => {
+                self.auto_renew_via_gateway_card(sub_id, PaymentMethod::Stripe)
+                    .await
             }
             "revolut" => self.auto_renew_via_revolut(sub_id).await,
             other => bail!("No auto-renewal handler for provider {other}"),
@@ -3404,6 +3487,253 @@ pub(crate) mod revolut_offline_tests {
         // from the mocks.
         sub.set_settle_timeout_for_test(Duration::ZERO);
         (db, sub, user_id, sub_id)
+    }
+
+    fn gateway_method(user_id: u64, gateway_id: Option<u64>, provider: &str) -> UserPaymentMethod {
+        UserPaymentMethod {
+            provider: provider.to_string(),
+            gateway_method_id: gateway_id,
+            ..mk_method(user_id, "cus_gw", "pm_gw", true, true, (2999, 12))
+        }
+    }
+
+    async fn gateway_setup(
+        provider: &str,
+        gateway_id: Option<u64>,
+    ) -> (
+        Arc<MockDb>,
+        SubscriptionHandler,
+        Arc<lnvps_api_common::FakeGateway>,
+        u64,
+        u64,
+    ) {
+        let (db, sub, user_id, sub_id) = setup(true).await;
+        let fake = Arc::new(lnvps_api_common::FakeGateway::default());
+        let sub = sub.with_card_gateway(fake.clone());
+        db.insert_user_payment_method(&gateway_method(user_id, gateway_id, provider))
+            .await
+            .unwrap();
+        (db, sub, fake, user_id, sub_id)
+    }
+
+    #[tokio::test]
+    async fn saved_gateway_method_charges_through_the_gateway_not_in_process() {
+        for (provider, method) in [
+            ("revolut", PaymentMethod::Revolut),
+            ("stripe", PaymentMethod::Stripe),
+        ] {
+            let (db, sub, fake, user_id, sub_id) = gateway_setup(provider, Some(77)).await;
+            let payment = sub
+                .renew_subscription_with_mode(
+                    sub_id,
+                    method,
+                    1,
+                    RenewMode::Saved { method_id: None },
+                )
+                .await
+                .unwrap();
+            let charges = fake.charges.lock().unwrap();
+            assert_eq!(charges.len(), 1);
+            assert_eq!(charges[0].gateway_method_id, 77);
+            assert_eq!(charges[0].payment_id, payment.id);
+            assert_eq!(charges[0].customer_ref, user_id.to_string());
+            assert_eq!(charges[0].currency, "EUR");
+            assert_eq!(charges[0].amount, payment.amount + payment.tax);
+            assert!(lnvps_api_common::is_gateway_payment(
+                payment.external_id.as_deref()
+            ));
+            assert_eq!(payment.payment_method, method);
+            let stored = db.get_subscription_payment(&payment.id).await.unwrap();
+            assert!(!stored.is_paid);
+        }
+    }
+
+    #[tokio::test]
+    async fn saved_gateway_charge_settles_once_on_a_duplicate_webhook() {
+        use crate::payments::gateway::{GatewayEventOutcome, handle_gateway_event};
+        let (db, sub, _fake, _user, sub_id) = gateway_setup("stripe", Some(77)).await;
+        let payment = sub
+            .renew_subscription_with_mode(
+                sub_id,
+                PaymentMethod::Stripe,
+                1,
+                RenewMode::Saved { method_id: None },
+            )
+            .await
+            .unwrap();
+        let db_dyn: Arc<dyn lnvps_db::LNVpsDb> = db.clone();
+        let event = lnvps_api_common::GatewayEvent {
+            event_id: "e1".into(),
+            kind: "payment.paid".into(),
+            reference: hex::encode(&payment.id),
+            status: "paid".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            handle_gateway_event(&db_dyn, &sub, &event).await.unwrap(),
+            GatewayEventOutcome::Settled
+        );
+        let expires = db.get_subscription(sub_id).await.unwrap().expires;
+        assert!(expires.is_some());
+        assert_eq!(
+            handle_gateway_event(&db_dyn, &sub, &event).await.unwrap(),
+            GatewayEventOutcome::AlreadySettled
+        );
+        assert_eq!(db.get_subscription(sub_id).await.unwrap().expires, expires);
+    }
+
+    #[tokio::test]
+    async fn declined_saved_gateway_charge_leaves_no_payment_row() {
+        let (db, sub, fake, _user, sub_id) = gateway_setup("revolut", Some(77)).await;
+        *fake.fail_charges.lock().unwrap() = true;
+        let before = db.list_subscription_payments(sub_id).await.unwrap().len();
+        assert!(
+            sub.renew_subscription_with_mode(
+                sub_id,
+                PaymentMethod::Revolut,
+                1,
+                RenewMode::Saved { method_id: None },
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            db.list_subscription_payments(sub_id).await.unwrap().len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_saved_method_without_gateway_id_still_charges_in_process() {
+        let (db, mut sub, fake, _user, sub_id) = gateway_setup("revolut", None).await;
+        let fiat = Arc::new(MockFiat::default());
+        sub.set_revolut_for_test(fiat.clone());
+        sub.renew_subscription_with_mode(
+            sub_id,
+            PaymentMethod::Revolut,
+            1,
+            RenewMode::Saved { method_id: None },
+        )
+        .await
+        .unwrap();
+        assert!(fake.charges.lock().unwrap().is_empty());
+        assert_eq!(fiat.charged.lock().unwrap().len(), 1);
+        let _ = db;
+    }
+
+    #[tokio::test]
+    async fn saved_gateway_method_of_another_user_is_never_charged() {
+        let (db, sub, fake, user_id, sub_id) = gateway_setup("stripe", Some(77)).await;
+        let other = db.upsert_user(&[33u8; 32]).await.unwrap();
+        let theirs = db
+            .insert_user_payment_method(&gateway_method(other, Some(88), "stripe"))
+            .await
+            .unwrap();
+        let _ = user_id;
+        let r = sub
+            .renew_subscription_with_mode(
+                sub_id,
+                PaymentMethod::Stripe,
+                1,
+                RenewMode::Saved {
+                    method_id: Some(theirs),
+                },
+            )
+            .await;
+        assert!(r.is_err());
+        assert!(fake.charges.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_or_disabled_saved_gateway_methods_are_not_charged() {
+        let (db, sub, fake, user_id, sub_id) = gateway_setup("stripe", Some(77)).await;
+        let mut m = db
+            .list_user_payment_methods(user_id, Some("stripe"))
+            .await
+            .unwrap()
+            .remove(0);
+        m.enabled = false;
+        db.update_user_payment_method(&m).await.unwrap();
+        assert!(
+            sub.renew_subscription_with_mode(
+                sub_id,
+                PaymentMethod::Stripe,
+                1,
+                RenewMode::Saved { method_id: None },
+            )
+            .await
+            .is_err()
+        );
+        assert!(fake.charges.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn off_session_gateway_renewal_is_off_by_default_and_charges_nothing() {
+        let (db, sub, fake, _user, sub_id) = gateway_setup("stripe", Some(77)).await;
+        let before = db.list_subscription_payments(sub_id).await.unwrap().len();
+        assert!(sub.auto_renew(sub_id).await.is_err());
+        assert!(fake.charges.lock().unwrap().is_empty());
+        assert_eq!(
+            db.list_subscription_payments(sub_id).await.unwrap().len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn off_session_gateway_renewal_dry_run_charges_nothing() {
+        use lnvps_api_common::OffSessionRenewals;
+        let (db, sub, fake, _user, sub_id) = gateway_setup("stripe", Some(77)).await;
+        let sub = sub.with_off_session_renewals(OffSessionRenewals::DryRun);
+        let before = db.list_subscription_payments(sub_id).await.unwrap().len();
+        let err = sub.auto_renew(sub_id).await.unwrap_err();
+        assert!(err.to_string().contains("dry-run"));
+        assert!(fake.charges.lock().unwrap().is_empty());
+        assert_eq!(
+            db.list_subscription_payments(sub_id).await.unwrap().len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn off_session_gateway_renewal_live_charges_once_and_settles_once() {
+        use crate::payments::gateway::{GatewayEventOutcome, handle_gateway_event};
+        use lnvps_api_common::OffSessionRenewals;
+        let (db, sub, fake, _user, sub_id) = gateway_setup("revolut", Some(77)).await;
+        let sub = sub.with_off_session_renewals(OffSessionRenewals::Live);
+        let payment = sub.auto_renew(sub_id).await.unwrap();
+        assert_eq!(fake.charges.lock().unwrap().len(), 1);
+        assert_eq!(payment.renewal_source, Some(lnvps_db::RenewalSource::Auto));
+        let db_dyn: Arc<dyn lnvps_db::LNVpsDb> = db.clone();
+        let event = lnvps_api_common::GatewayEvent {
+            event_id: "e9".into(),
+            kind: "payment.paid".into(),
+            reference: hex::encode(&payment.id),
+            status: "paid".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            handle_gateway_event(&db_dyn, &sub, &event).await.unwrap(),
+            GatewayEventOutcome::Settled
+        );
+        assert_eq!(
+            handle_gateway_event(&db_dyn, &sub, &event).await.unwrap(),
+            GatewayEventOutcome::AlreadySettled
+        );
+        assert_eq!(fake.charges.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn off_session_gateway_renewal_live_declined_card_errors_without_a_row() {
+        use lnvps_api_common::OffSessionRenewals;
+        let (db, sub, fake, _user, sub_id) = gateway_setup("stripe", Some(77)).await;
+        let sub = sub.with_off_session_renewals(OffSessionRenewals::Live);
+        *fake.fail_charges.lock().unwrap() = true;
+        let before = db.list_subscription_payments(sub_id).await.unwrap().len();
+        assert!(sub.auto_renew(sub_id).await.is_err());
+        assert_eq!(
+            db.list_subscription_payments(sub_id).await.unwrap().len(),
+            before
+        );
     }
 
     /// A renewal freezes the VAT determination (rate/country/treatment/evidence

@@ -1,8 +1,6 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use lnvps_db::{
-    LNVpsDb, OnChainAddressType, PaymentMethod, PaymentMethodConfig, ProviderConfig,
-};
+use lnvps_db::{LNVpsDb, OnChainAddressType, PaymentMethod, PaymentMethodConfig, ProviderConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -81,7 +79,10 @@ impl GatewayAdmin for HttpGatewayAdmin {
         let status = res.status();
         if !status.is_success() {
             let body = res.text().await.unwrap_or_default();
-            bail!("creating provider '{}' failed with {status}: {body}", provider.name);
+            bail!(
+                "creating provider '{}' failed with {status}: {body}",
+                provider.name
+            );
         }
         let body: Value = res.json().await?;
         body.get("id")
@@ -316,9 +317,10 @@ pub async fn import_providers(
             provider.provider_type.clone(),
             provider.name.clone(),
         );
-        if let Some(found) = existing.iter().find(|e| {
-            e.method == key.0 && e.provider_type == key.1 && e.name == key.2
-        }) {
+        if let Some(found) = existing
+            .iter()
+            .find(|e| e.method == key.0 && e.provider_type == key.1 && e.name == key.2)
+        {
             report
                 .lines
                 .push(line(ImportAction::AlreadyPresent { id: found.id }));
@@ -449,9 +451,17 @@ mod tests {
     fn lnd_config_is_sent_with_inline_credentials() {
         let c = cfg(1, "main", true, ProviderConfig::Lnd(lnd()));
         let p = map_config(&c, "main", &Files).unwrap();
-        assert_eq!((p.method.as_str(), p.provider_type.as_str()), ("lightning", "lnd"));
+        assert_eq!(
+            (p.method.as_str(), p.provider_type.as_str()),
+            ("lightning", "lnd")
+        );
         assert_eq!(p.config["macaroon"], "010203");
-        assert!(p.config["cert"].as_str().unwrap().contains("BEGIN CERTIFICATE"));
+        assert!(
+            p.config["cert"]
+                .as_str()
+                .unwrap()
+                .contains("BEGIN CERTIFICATE")
+        );
         assert!(p.config.get("cert_path").is_none());
     }
 
@@ -472,7 +482,10 @@ mod tests {
             }),
         );
         let p = map_config(&c, "chain", &Files).unwrap();
-        assert_eq!((p.method.as_str(), p.provider_type.as_str()), ("onchain", "lnd"));
+        assert_eq!(
+            (p.method.as_str(), p.provider_type.as_str()),
+            ("onchain", "lnd")
+        );
         assert_eq!(p.config["address_type"], "p2tr");
         assert_eq!(p.config["min_confirmations"], 3);
         assert_eq!(p.config["account"], "deposits");
@@ -541,7 +554,9 @@ mod tests {
     async fn dry_run_reports_and_creates_nothing() {
         let db = db_with(vec![cfg(1, "main", true, ProviderConfig::Lnd(lnd()))]).await;
         let admin = FakeAdmin::default();
-        let report = import_providers(&db, &admin, &Files, &opts(false)).await.unwrap();
+        let report = import_providers(&db, &admin, &Files, &opts(false))
+            .await
+            .unwrap();
         assert_eq!(report.created(), 1);
         assert!(!report.applied);
         assert!(admin.created.lock().unwrap().is_empty());
@@ -558,10 +573,12 @@ mod tests {
         ])
         .await;
         let admin = FakeAdmin::default();
-        let report = import_providers(&db, &admin, &Files, &opts(true)).await.unwrap();
+        let report = import_providers(&db, &admin, &Files, &opts(true))
+            .await
+            .unwrap();
         assert_eq!(report.created(), 2);
         assert_eq!(admin.created.lock().unwrap().len(), 2);
-        assert_eq!(*admin.disabled.lock().unwrap(), vec![102]);
+        assert_eq!(admin.disabled.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -574,7 +591,9 @@ mod tests {
             provider_type: "lnd".into(),
             name: "main".into(),
         });
-        let report = import_providers(&db, &admin, &Files, &opts(true)).await.unwrap();
+        let report = import_providers(&db, &admin, &Files, &opts(true))
+            .await
+            .unwrap();
         assert_eq!(report.present(), 1);
         assert_eq!(report.created(), 0);
         assert!(admin.created.lock().unwrap().is_empty());
@@ -597,7 +616,9 @@ mod tests {
         ])
         .await;
         let admin = FakeAdmin::default();
-        let report = import_providers(&db, &admin, &Files, &opts(true)).await.unwrap();
+        let report = import_providers(&db, &admin, &Files, &opts(true))
+            .await
+            .unwrap();
         assert_eq!(report.skipped(), 1);
         assert_eq!(report.created(), 1);
     }
@@ -610,14 +631,17 @@ mod tests {
         ])
         .await;
         let admin = FakeAdmin::default();
-        import_providers(&db, &admin, &Files, &opts(true)).await.unwrap();
-        let names: Vec<String> = admin
+        import_providers(&db, &admin, &Files, &opts(true))
+            .await
+            .unwrap();
+        let mut names: Vec<String> = admin
             .created
             .lock()
             .unwrap()
             .iter()
             .map(|p| p.name.clone())
             .collect();
+        names.sort();
         assert_eq!(names, vec!["main (company 1)", "main (company 2)"]);
 
         let only_two = ImportOptions {

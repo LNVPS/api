@@ -2077,7 +2077,7 @@ impl PricingEngine {
                     rate: TickerRate::passthrough(Currency::BTC),
                 }
             }
-            (c, PaymentMethod::Revolut) if c != Currency::BTC => {
+            (c, PaymentMethod::Revolut | PaymentMethod::Stripe) if c != Currency::BTC => {
                 // convert to base_currency if price is not already in bitcoin
                 let ticker = self.get_ticker(list_price.currency(), c).await?;
                 ticker.convert_scaled_with_rate(list_price, scale)?
