@@ -60,7 +60,8 @@ Without a `gateway` section, or without `lightning` in `methods`, nothing change
 - The webhook handler verifies the `X-Gateway-Signature` header, looks up the `subscription_payment` by the `reference`, and calls `SubscriptionHandler::complete_payment`. `subscription_payment_paid` only updates a row with `is_paid = 0`, and the handler also skips rows already paid, so replays are no-ops.
 - The in-process `NodeInvoiceHandler` keeps running, so invoices created before the cutover still settle on the old path.
 - Competing upgrade payments that get expired on settlement are cancelled at the gateway when their `external_id` starts with `pgw:`.
-- `payment.expired` and `payment.cancelled` events are logged only. The LNVPS row expires by its own `expires` column.
+- `payment.expired` and `payment.cancelled` events are logged only. The LNVPS row expires by its own `expires` column. A sweep (every 60 seconds, only when a `gateway` section exists) cancels the gateway payment of every unpaid `pgw:` row past its `expires`, then renames its `external_id` to `pgw-cancelled:<id>` so it is cancelled once. A failed cancel is retried on the next pass.
+- `attempt.failed` expires the unpaid LNVPS row and notifies the user; it never extends the subscription. `refund.completed` books one `Refund` row (keyed by the gateway refund id, capped at what is still refundable) and never re-credits or touches expiry. Both ignore references that are not `pgw:` payments of this deployment, and replays change nothing.
 
 ## Cutover
 
