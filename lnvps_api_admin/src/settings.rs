@@ -30,12 +30,28 @@ pub struct Settings {
     #[serde(default)]
     pub rate_limit: lnvps_api_common::RateLimitConfig,
 
+    /// Shared session secret, the same value the public API signs with. Needed
+    /// to verify the step-up tokens it issues after a fresh passkey assertion.
+    pub session: Option<SessionConfig>,
+
+    /// Require a fresh passkey step-up for refunds, purges, credit adjustment
+    /// and role changes. Off by default so existing admin keys keep working
+    /// until their owners have registered a passkey.
+    #[serde(default)]
+    pub require_step_up: bool,
+
     #[serde(default = "default_chain_explorer_url")]
     pub chain_explorer_url: Option<String>,
 }
 
 fn default_chain_explorer_url() -> Option<String> {
     Some("https://mempool.space".to_string())
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct SessionConfig {
+    pub secret: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

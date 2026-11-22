@@ -25,8 +25,8 @@ use crate::single_use::SingleUseGuard;
 /// disabled and only Nostr (NIP-98) auth is accepted.
 static SESSION_SECRET: OnceLock<Vec<u8>> = OnceLock::new();
 
-/// Default session lifetime (30 days) if the caller does not specify one.
-pub const DEFAULT_SESSION_TTL_SECS: u64 = 60 * 60 * 24 * 30;
+/// Default session lifetime (7 days) if the caller does not specify one.
+pub const DEFAULT_SESSION_TTL_SECS: u64 = 60 * 60 * 24 * 7;
 
 /// Install the session signing secret. Idempotent — the first non-empty secret
 /// wins; subsequent calls are ignored. Returns `true` if this call installed it.
@@ -344,6 +344,50 @@ pub fn verify_state_token(token: &str) -> Result<(String, Option<String>)> {
     Ok((claims.prov, claims.redirect))
 }
 
+pub const STEP_UP_TTL_SECS: u64 = 300;
+pub const STEP_UP_HEADER: &str = "x-step-up";
+const STEP_UP_PURPOSE: &str = "step-up";
+
+static STEP_UP_REQUIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_step_up_required(required: bool) {
+    STEP_UP_REQUIRED.store(required, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn step_up_required() -> bool {
+    STEP_UP_REQUIRED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+pub fn issue_step_up_token(uid: u64, ttl_secs: u64) -> Result<String> {
+    issue_challenge_token(STEP_UP_PURPOSE, &uid.to_string(), ttl_secs)
+}
+
+pub fn verify_step_up_token(token: &str, uid: u64) -> bool {
+    let Some(secret) = SESSION_SECRET.get() else {
+        return false;
+    };
+    let mut parts = token.split('.');
+    let (Some(payload_b64), Some(sig_b64), None) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let Ok(expected_sig) = BASE64_URL_SAFE_NO_PAD.decode(sig_b64.as_bytes()) else {
+        return false;
+    };
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(payload_b64.as_bytes());
+    if mac.verify_slice(&expected_sig).is_err() {
+        return false;
+    }
+    let Ok(raw) = BASE64_URL_SAFE_NO_PAD.decode(payload_b64.as_bytes()) else {
+        return false;
+    };
+    let Ok(claims) = serde_json::from_slice::<ChallengeClaims>(&raw) else {
+        return false;
+    };
+    claims.purpose == STEP_UP_PURPOSE && claims.payload == uid.to_string() && now_secs() < claims.exp
+}
+
 /// Claims for a short-lived, path-scoped, single-use websocket/HTML auth ticket.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TicketClaims {
@@ -566,6 +610,20 @@ mod tests {
     /// `login/finish` body could be replayed for the whole 5 minute TTL to mint
     /// extra sessions. The signature counter is no defence — most passkeys
     /// report a constant 0.
+    #[test]
+    fn a_step_up_token_is_bound_to_its_user_and_expires() {
+        init_session_secret(b"unit-test-secret".to_vec());
+        let t = issue_step_up_token(5, STEP_UP_TTL_SECS).unwrap();
+        assert!(verify_step_up_token(&t, 5));
+        assert!(verify_step_up_token(&t, 5), "reusable inside its window");
+        assert!(!verify_step_up_token(&t, 6));
+        assert!(!verify_step_up_token("junk", 5));
+        let expired = issue_step_up_token(5, 0).unwrap();
+        assert!(!verify_step_up_token(&expired, 5));
+        let other = issue_challenge_token("webauthn-auth", "5", 300).unwrap();
+        assert!(!verify_step_up_token(&other, 5));
+    }
+
     #[test]
     fn challenge_token_is_single_use() {
         init_session_secret(b"unit-test-secret".to_vec());

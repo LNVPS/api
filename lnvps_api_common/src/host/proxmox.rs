@@ -280,6 +280,71 @@ impl ProxmoxClient {
         Ok(rsp.data)
     }
 
+    async fn sync_ipfilter(&self, cfg: &FullVmInfo) -> OpResult<()> {
+        let vm_id: ProxmoxVmId = cfg.vm.id.into();
+        const SET: &str = "ipfilter-net0";
+        if self
+            .list_vm_ipset_entries(&self.node, vm_id, SET)
+            .await
+            .is_err()
+        {
+            self.add_vm_ipset(
+                &self.node,
+                vm_id,
+                CreateVmIpsetRequest {
+                    name: SET.to_string(),
+                    comment: Some("Allowed addresses for net0".to_string()),
+                    digest: None,
+                    rename: None,
+                },
+            )
+            .await?;
+        }
+
+        let existing = self.list_vm_ipset_entries(&self.node, vm_id, SET).await?;
+        let wanted: Vec<IpAddr> = cfg
+            .ips
+            .iter()
+            .filter_map(|ip| ip.ip.parse::<IpAddr>().ok())
+            .collect();
+
+        for entry in &existing {
+            if let Ok(addr) = entry.cidr.parse::<IpAddr>() {
+                if !wanted.contains(&addr) {
+                    self.remove_vm_ipset_entry(&self.node, vm_id, SET, &entry.cidr)
+                        .await?;
+                }
+            }
+        }
+
+        let present: Vec<IpAddr> = existing
+            .iter()
+            .filter_map(|e| e.cidr.parse::<IpAddr>().ok())
+            .collect();
+        for addr in wanted {
+            if present.contains(&addr) {
+                continue;
+            }
+            let comment = if addr.is_ipv4() {
+                "VM IPv4 address"
+            } else {
+                "VM IPv6 address"
+            };
+            self.add_vm_ipset_entry(
+                &self.node,
+                vm_id,
+                SET,
+                CreateVmIpsetEntryRequest {
+                    cidr: addr.to_string(),
+                    comment: Some(comment.to_string()),
+                    nomatch: None,
+                },
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Configure a VM
     ///
     /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu/{vmid}/config
@@ -2558,6 +2623,15 @@ impl VmHostClient for ProxmoxClient {
         // Apply disk options / throttle limits (requires reading live scsi0 path)
         self.apply_disk_options(cfg).await?;
 
+        if self
+            .config
+            .firewall_config
+            .as_ref()
+            .is_some_and(|c| c.enable.unwrap_or(false))
+        {
+            self.sync_ipfilter(cfg).await?;
+        }
+
         Ok(())
     }
 
@@ -2674,73 +2748,7 @@ impl VmHostClient for ProxmoxClient {
         self.configure_vm_firewall(&self.node, vm_id, firewall_config)
             .await?;
 
-        // Only manage IPsets and rules if firewall is enabled
-        // Ensure ipfilter-net0 IPset exists
-        if let Err(_) = self
-            .list_vm_ipset_entries(&self.node, vm_id, "ipfilter-net0")
-            .await
-        {
-            self.add_vm_ipset(
-                &self.node,
-                vm_id,
-                CreateVmIpsetRequest {
-                    name: "ipfilter-net0".to_string(),
-                    comment: Some("Allowed addresses for net0".to_string()),
-                    digest: None,
-                    rename: None,
-                },
-            )
-            .await?;
-        }
-
-        // Get existing entries to avoid duplicates
-        let existing_entries = self
-            .list_vm_ipset_entries(&self.node, vm_id, "ipfilter-net0")
-            .await?;
-        let existing_cidrs: std::collections::HashSet<String> = existing_entries
-            .iter()
-            .map(|entry| entry.cidr.clone())
-            .collect();
-
-        // Add new IPv4 and IPv6 addresses that don't already exist
-        for ip in &cfg.ips {
-            if let Ok(addr) = ip.ip.parse::<IpAddr>() {
-                match addr {
-                    IpAddr::V4(ipv4_addr) => {
-                        let ip_str = ipv4_addr.to_string();
-                        if !existing_cidrs.contains(&ip_str) {
-                            self.add_vm_ipset_entry(
-                                &self.node,
-                                vm_id,
-                                "ipfilter-net0",
-                                CreateVmIpsetEntryRequest {
-                                    cidr: ip_str,
-                                    comment: Some("VM IPv4 address".to_string()),
-                                    nomatch: None,
-                                },
-                            )
-                            .await?;
-                        }
-                    }
-                    IpAddr::V6(ipv6_addr) => {
-                        let ip_str = ipv6_addr.to_string();
-                        if !existing_cidrs.contains(&ip_str) {
-                            self.add_vm_ipset_entry(
-                                &self.node,
-                                vm_id,
-                                "ipfilter-net0",
-                                CreateVmIpsetEntryRequest {
-                                    cidr: ip_str,
-                                    comment: Some("VM IPv6 address".to_string()),
-                                    nomatch: None,
-                                },
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
-        }
+        self.sync_ipfilter(cfg).await?;
 
         // NOTE: We intentionally do NOT add a blanket `IN ACCEPT -dest
         // +guest/ipfilter-net0` rule. Anti-spoofing is already provided by the
@@ -3924,6 +3932,49 @@ mod tests {
             None,
         );
         assert!(client.ensure_ssh_node().await.is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipfilter_set_drops_the_old_ip_when_the_assignment_changes() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/qemu/101/firewall/ipset/ipfilter-net0$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"cidr": "10.9.9.244"}, {"cidr": "192.168.1.2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r".*/qemu/101/firewall/ipset/ipfilter-net0/10\.9\.9\.244$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/qemu/101/firewall/ipset/ipfilter-net0$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let client = ProxmoxClient::new(server.uri().parse()?, "pve", "", None, q_cfg, None);
+        let mut info = mock_full_vm();
+        info.vm.id = 1;
+        info.ips.truncate(2);
+        client
+            .sync_ipfilter(&info)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         Ok(())
     }
 

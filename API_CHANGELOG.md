@@ -9,6 +9,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - **Admin capabilities marker**: `GET /api/admin/v1/capabilities` (any admin permission) returns `{vm_migrate: {version: 2, options: [...]}}` listing the migrate options the server supports (`ip_policy`, `keep_source`, `target_disk_id`, `dry_run`, `timeout_secs_per_gb`). `POST /api/admin/v1/vms/{id}/migrate` now rejects unknown body fields with 422 instead of ignoring them; the old `{target_host_id, live, reason}` body still works.
+- **API tokens**: `GET`/`POST /api/v1/account/tokens` and `DELETE /api/v1/account/tokens/{id}`. Create with `{name, scope: "read"|"vm", expires_in_days}` (default 90, max 365); the secret (`lnvps_...`) is returned once. Use as `Authorization: Bearer`. `read` allows GET on `/api/v1`, `vm` adds start, stop and restart. Tokens cannot reach the admin API, payments, or token management. Responses list `last_used` and `last_ip`. Needs migration `20261201000100_api_token.sql`.
+- **Per-account rate limits** on VM orders (20/h), renew and upgrade payments (60/h) and admin refunds (10/h), shared through Redis when configured. Exceeding returns 429.
+- **Step-up**: `POST /api/v1/webauthn/step-up/start` and `/finish` return a 5 minute token for the `X-Step-Up` header. With admin config `require-step-up: true`, refunds, VM purge, credit adjustment and role changes need it.
+- **Audit**: login, passkey add, token create and revoke, email change, firewall changes, reinstall, and all VM history and IP order events are now in the audit log. `audit_log.ip` is truncated to /24 or /48 after 90 days (migration `20261201000000_audit_log_ip_truncate.sql`).
+- **Support agent handoff**: in live chat a logged-in customer's chat can be emailed to support by the agent (`escalate_to_support`, sent from the `smtp` settings to the new agent setting `support-email`, default `support@lnvps.net`). Reply-To is the account email, and the Message-ID `<support-<conversation id>@domain>` threads repeat escalations. At most one per conversation per 24 h unless a new VM is named. `GET /api/admin/v1/agent/conversations` adds `escalated_at`, `escalation_count`, `escalation_reason`, `escalation_vm_ids`. Needs migration `20261119163956_agent_escalation.sql`.
+- **Support agent**: a VM that does not answer on the edge router's network now returns `no_reply_from_vm` instead of a "looking glass unavailable" error.
+- **Abuse alert**: a new account ordering a large template with a throwaway email domain notifies admins.
+
+### Changed
+
+- Session tokens now default to 7 days (was 30). The `session.ttl` setting still overrides it.
+- NIP-98 single-use tracking is shared through Redis when configured.
+
+- **Audit log**: `GET /api/admin/v1/audit-log` (filters `actor_type`, `actor_id`, `action`, `target_type`, `target_id`, `since`, `until`, `limit`, `offset`) and `GET /api/admin/v1/audit-log/verify`, both needing `audit::view`. Entries are hash-chained and append-only. Needs migration `20261115172956_audit_log.sql`.
+- **Key rotation**: `LNVPS_ENCRYPTION_KEY_PREVIOUS` (comma separated hex keys) keeps old ciphertexts readable, and the `rotate_encryption_key` binary re-encrypts every encrypted column. `verify_audit_log` checks the audit chain.
+
+### Changed
+
+- **Billing details are encrypted at rest** (name, address lines, city, state, postcode, tax id). Needs migration `20261115173632_billing_pii_wide.sql`. Run `rotate_encryption_key` once to encrypt existing rows.
+- **Release builds refuse to start without an encryption key** and ignore `encryption.auto-generate`.
+
+### Changed
+
+- **Owner VM delete refunds in the billing currency**: the cash-paid share of a refund on VM deletion now comes back as account credit in the subscription's billing currency (EUR for a EUR-priced VM), valued at the payment's own stored `rate`, whatever method paid it. This corrects the earlier "Refund credit in the source currency" entry: card and Revolut payers got EUR, but Lightning and on-chain payers got sats. The refund row metadata gains `billing_currency`, and for a converted payment `original_currency`, `original_amount` and `rate`. The credit-paid share still returns to the balance it came from.
+- **Credit balances combine on one bill**: a bill is covered by the balance in the bill currency first, then other balances at the current rate, until it is paid. A payment can hold one debit per balance currency. Needs migration `20261109192010_credit_debit_per_currency.sql`.
+
+### Added
+
+- **Rebook old BTC refund balances**: `POST /api/admin/v1/credit/rebook_btc_refunds` (permission `account_credit::update`) finds owner-delete `refund` ledger events in BTC for EUR-billed subscriptions and moves each to billing-currency credit at the original payment's rate. Dry run by default (`?dry_run=false` to apply, optional `since`). The report lists user, BTC amount, billing amount and whether the BTC was already spent (those are left alone).
+
+### Added
 
 - **Migrate VMs between host kinds and regions**: `POST /api/admin/v1/vms/{id}/migrate` accepts `ip_policy` (`keep` default, `reassign`), `keep_source` (default `true`), `target_disk_id`, `timeout_secs_per_gb` and `dry_run`. libvirt and marketplace node VMs, and Proxmox VMs changing region, move to Proxmox by an offline checksummed disk copy with rollback; Proxmox to Proxmox in one region still uses `qm migrate`. The response gains `plan` (method, bytes, estimate, address changes, warnings, refusals); `dry_run: true` returns only the plan. Plans with refusals now return 409 instead of failing in the job. VM history gains the `migration_progress` action, also returned by the admin VM history endpoints. Old request bodies behave as before. Needs migration `20261106215109_vm_migration.sql`.
 

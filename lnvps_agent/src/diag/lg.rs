@@ -26,6 +26,11 @@ pub const DEFAULT_SERVER: &str = "edge1";
 /// returns "unreachable" rather than a client timeout the model must guess at.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
 
+#[cfg(not(test))]
+const RETRY_DELAY: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const RETRY_DELAY: Duration = Duration::from_millis(1);
+
 /// One line of the mtr report.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Hop {
@@ -43,7 +48,7 @@ pub struct Hop {
 impl Hop {
     /// Whether this hop answered at all.
     pub fn responded(&self) -> bool {
-        self.host != "???" && self.rtt_ms.is_some()
+        self.host != "???" && self.rtt_ms.is_some() && self.loss_percent < 100.0
     }
 }
 
@@ -64,7 +69,16 @@ pub struct Traceroute {
     pub rtt_ms: Option<f32>,
     /// Full path, so the model can point at where a path dies.
     pub hops: Vec<Hop>,
+    /// `no_reply_from_vm` when the looking glass answered but the report held
+    /// no hop at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meaning: Option<&'static str>,
 }
+
+pub const NO_REPLY_FROM_VM: &str = "no_reply_from_vm";
+pub const NO_REPLY_MEANING: &str = "The edge router got no reply from this VM on its local network. The looking glass itself is working. The VM is off, its network is down, or its firewall drops everything.";
 
 /// Client for the public looking glass.
 #[derive(Debug, Clone)]
@@ -98,17 +112,30 @@ impl LookingGlass {
     /// `target` is an [`IpAddr`] rather than a string so no caller can smuggle
     /// a hostname, a second path segment, or a BIRD command into the URL.
     pub async fn traceroute(&self, target: IpAddr) -> Result<Traceroute> {
+        match self.traceroute_once(target).await {
+            Ok(trace) => Ok(trace),
+            Err(_) => {
+                tokio::time::sleep(RETRY_DELAY).await;
+                self.traceroute_once(target).await
+            }
+        }
+    }
+
+    async fn traceroute_once(&self, target: IpAddr) -> Result<Traceroute> {
         let url = format!("{}/traceroute/{}/{}", self.base_url, self.server, target);
         let response = self
             .http
             .get(&url)
             .send()
             .await
-            .context("looking glass request failed")?;
+            .context("looking glass unavailable: request failed")?;
         if !response.status().is_success() {
-            bail!("looking glass returned {}", response.status());
+            bail!("looking glass unavailable: returned {}", response.status());
         }
-        let body = response.text().await.context("looking glass read failed")?;
+        let body = response
+            .text()
+            .await
+            .context("looking glass unavailable: read failed")?;
         parse_mtr(&strip_html(&body), target, &self.server)
     }
 }
@@ -145,20 +172,40 @@ fn strip_html(html: &str) -> String {
 fn parse_mtr(text: &str, target: IpAddr, server: &str) -> Result<Traceroute> {
     let hops: Vec<Hop> = text.lines().filter_map(parse_hop).collect();
     if hops.is_empty() {
+        if text.lines().any(|l| l.trim_start().starts_with("HOST:")) {
+            return Ok(Traceroute {
+                target: target.to_string(),
+                from: server.to_string(),
+                reached: false,
+                loss_percent: None,
+                rtt_ms: None,
+                hops,
+                status: Some(NO_REPLY_FROM_VM),
+                meaning: Some(NO_REPLY_MEANING),
+            });
+        }
         bail!(
-            "looking glass returned no traceroute output for {} — the probe tool on the edge may be unavailable",
+            "looking glass unavailable: no traceroute report for {} in its answer",
             target
         );
     }
-    let final_hop = hops.iter().rev().find(|h| h.host == target.to_string());
+    let final_hop = hops
+        .last()
+        .filter(|h| h.host == target.to_string() || is_vm_hostname(&h.host));
     Ok(Traceroute {
         target: target.to_string(),
         from: server.to_string(),
         reached: final_hop.map(Hop::responded).unwrap_or(false),
         loss_percent: final_hop.map(|h| h.loss_percent),
-        rtt_ms: final_hop.and_then(|h| h.rtt_ms),
+        rtt_ms: final_hop.filter(|h| h.responded()).and_then(|h| h.rtt_ms),
         hops,
+        status: None,
+        meaning: None,
     })
+}
+
+fn is_vm_hostname(host: &str) -> bool {
+    host.starts_with("vm-") && host.ends_with(".lnvps.cloud")
 }
 
 /// Parse a single `N.|-- host loss% snt last ...` line.
@@ -231,6 +278,44 @@ HOST: router        Loss%   Snt   Last   Avg  Best  Wrst StDev
         assert_eq!(tr.rtt_ms, None);
     }
 
+    const HEADER_ONLY_PAGE: &str = "<div class=\"container\">\n\t<h2>edge1: 185.18.221.221</h2>\n<pre>Start: 2026-11-19T16:37:07+0000\nHOST: router Loss%   Snt   Last   Avg  Best  Wrst StDev\n</pre>\n\n</div>";
+
+    #[test]
+    fn header_only_report_is_no_reply_from_vm() {
+        let tr = parse_mtr(&strip_html(HEADER_ONLY_PAGE), target(), "edge1").unwrap();
+        assert_eq!(tr.status, Some("no_reply_from_vm"));
+        assert!(tr.meaning.unwrap().contains("no reply from this VM"));
+        assert!(!tr.reached);
+        assert!(tr.hops.is_empty());
+    }
+
+    #[tokio::test]
+    async fn header_only_answer_is_not_an_unavailable_looking_glass() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(HEADER_ONLY_PAGE))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let lg = LookingGlass::new(server.uri(), "edge1");
+        let tr = lg.traceroute(target()).await.unwrap();
+        assert_eq!(tr.status, Some(NO_REPLY_FROM_VM));
+    }
+
+    #[tokio::test]
+    async fn http_failure_is_the_only_unavailable_case() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(502))
+            .mount(&server)
+            .await;
+        let err = LookingGlass::new(server.uri(), "edge1")
+            .traceroute(target())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("looking glass unavailable"));
+    }
+
     #[test]
     fn empty_output_is_an_error() {
         assert!(parse_mtr("no hops here", target(), "edge1").is_err());
@@ -290,5 +375,46 @@ HOST: router        Loss%   Snt   Last   Avg  Best  Wrst StDev
             .await;
         let lg = LookingGlass::new(server.uri(), "edge1");
         assert!(lg.traceroute(target()).await.is_err());
+    }
+
+    #[test]
+    fn a_hop_with_total_loss_is_not_a_response() {
+        let report = "  1.|-- 10.0.0.1       0.0%     5    0.4   0.5   0.4   0.6   0.0\n  2.|-- vm-1.lnvps.cloud 100.0%     5    1.0   1.0   1.0   1.0   0.0\n";
+        let tr = parse_mtr(report, target(), "edge1").unwrap();
+        assert!(!tr.hops[1].responded());
+        assert!(!tr.reached);
+    }
+
+    #[test]
+    fn a_vm_hostname_as_final_hop_is_the_target() {
+        let report = "  1.|-- 10.0.0.1       0.0%     5    0.4   0.5   0.4   0.6   0.0\n  2.|-- vm-1.lnvps.cloud  0.0%     5    0.3   0.3   0.3   0.3   0.0\n";
+        let tr = parse_mtr(report, target(), "edge1").unwrap();
+        assert!(tr.reached);
+        assert_eq!(tr.rtt_ms, Some(0.3));
+    }
+
+    #[test]
+    fn a_transit_router_name_is_not_the_target() {
+        let report = "  1.|-- 10.0.0.1       0.0%     5    0.4   0.5   0.4   0.6   0.0\n  2.|-- core.example.net  0.0%     5    0.3   0.3   0.3   0.3   0.0\n";
+        assert!(!parse_mtr(report, target(), "edge1").unwrap().reached);
+    }
+
+    #[tokio::test]
+    async fn traceroute_retries_once_when_the_first_answer_is_empty() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string("<pre></pre>"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_string(format!("<pre>{REPORT}</pre>")),
+            )
+            .mount(&server)
+            .await;
+        let lg = LookingGlass::new(server.uri(), "edge1");
+        assert!(lg.traceroute(target()).await.unwrap().reached);
     }
 }

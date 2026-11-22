@@ -1238,6 +1238,7 @@ mod tests {
             .map(|action| Permission { resource, action })
             .collect(),
             nip98_auth: None,
+            step_up: false,
         };
         let admin = || auth(AdminResource::Router);
 
@@ -1446,6 +1447,7 @@ mod tests {
             })
             .collect(),
             nip98_auth: None,
+            step_up: false,
         };
 
         // The pool is stored even though the interface could not be pushed:
@@ -1474,6 +1476,7 @@ mod tests {
             .into_iter()
             .collect(),
             nip98_auth: None,
+            step_up: false,
         };
         let _ = admin_delete_tunnel_pool(admin, State(this.clone()), Path(pool_id))
             .await

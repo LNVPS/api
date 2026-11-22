@@ -22,9 +22,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use lnvps_api_common::{
-    ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate,
+    AccountAction, ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate,
     ClientInfo, ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, SnapshotAction,
-    TraderDetails, UpgradeConfig, UserRateLimiter, VatClient, WorkJob, apply_custom_pricing_limits,
+    TraderDetails, UpgradeConfig, UserRateLimiter, VatClient, WorkJob, apply_custom_pricing_limits, enforce_account_limit,
 };
 use lnvps_db::{
     CpuArch, LNVpsDb, PaymentMethod, Region, Vm, VmCustomPricing, VmCustomPricingDisk,
@@ -111,6 +111,15 @@ pub fn routes() -> Router<RouterState> {
                 post(v1_telegram_link).delete(v1_telegram_unlink),
             )
             .route("/api/v1/account/sessions", delete(v1_revoke_all_sessions))
+            .route(
+                "/api/v1/account/tokens",
+                get(crate::api::tokens::v1_list_api_tokens)
+                    .post(crate::api::tokens::v1_create_api_token),
+            )
+            .route(
+                "/api/v1/account/tokens/{id}",
+                delete(crate::api::tokens::v1_delete_api_token),
+            )
             .route("/api/v1/auth/ticket", post(v1_issue_auth_ticket))
             .route(
                 "/api/v1/account/whatsapp/verify",
@@ -228,10 +237,35 @@ async fn capture_client_geo(this: &RouterState, uid: u64, client_ip: ClientIp) {
     }
 }
 
+async fn flag_suspicious_order(this: &RouterState, user: &lnvps_db::User, vm_id: u64, cpu: u16, memory: u64) {
+    let signals = lnvps_api_common::order_signals(
+        user.created,
+        Utc::now(),
+        cpu,
+        memory,
+        user.email.as_str(),
+    );
+    if !lnvps_api_common::should_alert(&signals) {
+        return;
+    }
+    lnvps_api_common::log_suspicious_order(user.id, vm_id, &signals);
+    if let Err(e) = this
+        .work_sender
+        .send(WorkJob::SendAdminNotification {
+            message: lnvps_api_common::alert_message(user.id, vm_id, &signals),
+            title: Some("Suspicious order".to_string()),
+        })
+        .await
+    {
+        warn!("Failed to queue suspicious order alert: {}", e);
+    }
+}
+
 /// Update user account
 async fn v1_patch_account(
     auth: Nip98Auth,
     client_ip: ClientIp,
+    client: ClientInfo,
     State(this): State<RouterState>,
     req: Json<AccountPatchRequest>,
 ) -> ApiResult<AccountPatchResult> {
@@ -257,6 +291,16 @@ async fn v1_patch_account(
             let email_changed = old_email != new_email.as_str();
             user.email = new_email.clone().into();
             if email_changed {
+                lnvps_api_common::audit_user_action(
+                    this.db.as_ref(),
+                    &client,
+                    uid,
+                    auth.auth_method(),
+                    "user.email.change",
+                    ("user", uid),
+                    None,
+                )
+                .await?;
                 // Mark email as unverified and generate a verification token.
                 // Only the SHA-256 hash is stored; the raw token goes to the
                 // user's inbox and is compared by hash on submission.
@@ -310,25 +354,25 @@ async fn v1_patch_account(
             .map(|c| c.alpha3().to_string());
     }
     if let Some(name) = &req.name {
-        user.billing_name = name.clone();
+        user.billing_name = name.clone().map(Into::into);
     }
     if let Some(address_1) = &req.address_1 {
-        user.billing_address_1 = address_1.clone();
+        user.billing_address_1 = address_1.clone().map(Into::into);
     }
     if let Some(address_2) = &req.address_2 {
-        user.billing_address_2 = address_2.clone();
+        user.billing_address_2 = address_2.clone().map(Into::into);
     }
     if let Some(city) = &req.city {
-        user.billing_city = city.clone();
+        user.billing_city = city.clone().map(Into::into);
     }
     if let Some(state) = &req.state {
-        user.billing_state = state.clone();
+        user.billing_state = state.clone().map(Into::into);
     }
     if let Some(postcode) = &req.postcode {
-        user.billing_postcode = postcode.clone();
+        user.billing_postcode = postcode.clone().map(Into::into);
     }
     if let Some(tax_id) = &req.tax_id {
-        user.billing_tax_id = tax_id.clone();
+        user.billing_tax_id = tax_id.clone().map(Into::into);
     }
 
     // Validate the tax ID (VAT number) against VIES when one is set, and ask
@@ -343,15 +387,18 @@ async fn v1_patch_account(
         .filter(|s| !s.is_empty())
     {
         let trader = TraderDetails {
-            name: user.billing_name.clone(),
+            name: user.billing_name.as_ref().map(|v| v.as_str().to_string()),
             street: match (&user.billing_address_1, &user.billing_address_2) {
                 (Some(a1), Some(a2)) if !a2.trim().is_empty() => Some(format!("{} {}", a1, a2)),
-                (Some(a1), _) => Some(a1.clone()),
-                (None, Some(a2)) => Some(a2.clone()),
+                (Some(a1), _) => Some(a1.as_str().to_string()),
+                (None, Some(a2)) => Some(a2.as_str().to_string()),
                 _ => None,
             },
-            postal_code: user.billing_postcode.clone(),
-            city: user.billing_city.clone(),
+            postal_code: user
+                .billing_postcode
+                .as_ref()
+                .map(|v| v.as_str().to_string()),
+            city: user.billing_city.as_ref().map(|v| v.as_str().to_string()),
             company_type: None,
         };
         let result = VatClient::new()
@@ -1321,6 +1368,7 @@ async fn v1_create_custom_vm_order(
 ) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
+    enforce_account_limit(AccountAction::VmOrder, uid).await?;
 
     // Capture place-of-supply evidence at purchase time (see capture_client_geo).
     capture_client_geo(&this, uid, client_ip).await;
@@ -1337,12 +1385,14 @@ async fn v1_create_custom_vm_order(
 
     // create a fake template from the request to generate the order
     let template = req.spec.clone().into();
+    let (spec_cpu, spec_memory) = (req.spec.cpu, req.spec.memory);
 
     let rsp = this
         .sub_handler
         .vm_provisioner()
         .provision_custom(uid, template, req.image_id, req.ssh_key_id, req.ref_code)
         .await?;
+    flag_suspicious_order(&this, &user, rsp.id, spec_cpu, spec_memory).await;
 
     // Log VM creation
     this.history
@@ -1392,6 +1442,7 @@ async fn v1_list_ssh_keys(
 /// Add new SSH key to account
 async fn v1_add_ssh_key(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Json(req): Json<CreateSshKey>,
 ) -> ApiResult<ApiUserSshKey> {
@@ -1415,6 +1466,17 @@ async fn v1_add_ssh_key(
             .into(),
         ..Default::default()
     };
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("user", Some(uid), "user.ssh_key.add")
+                .auth(auth.auth_method(), None)
+                .target("user", uid)
+                .change(None, Some(new_key.name.clone())),
+            &client,
+        ),
+    )
+    .await?;
     let key_id = this.db.insert_user_ssh_key(&new_key).await?;
     new_key.id = key_id;
 
@@ -1460,6 +1522,7 @@ async fn v1_create_vm_order(
 ) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
+    enforce_account_limit(AccountAction::VmOrder, uid).await?;
 
     // Capture place-of-supply evidence at purchase time (see capture_client_geo).
     capture_client_geo(&this, uid, client_ip).await;
@@ -1473,6 +1536,7 @@ async fn v1_create_vm_order(
         ));
     }
 
+    let template = this.db.get_vm_template(req.template_id).await?;
     let rsp = this
         .sub_handler
         .vm_provisioner()
@@ -1484,6 +1548,7 @@ async fn v1_create_vm_order(
             req.ref_code,
         )
         .await?;
+    flag_suspicious_order(&this, &user, rsp.id, template.cpu, template.memory).await;
 
     if let Err(e) = ensure_hourly_order_funded(&this, &rsp).await {
         // Nothing was paid and nothing provisioned on a host yet; remove the
@@ -1564,6 +1629,7 @@ async fn v1_renew_vm(
     Query(q): Query<PaymentMethodQuery>,
 ) -> ApiResult<ApiVmPayment> {
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    enforce_account_limit(AccountAction::Payment, uid).await?;
     let intervals = q.validated_intervals()?;
     let vm_line = this
         .db
@@ -1813,12 +1879,24 @@ async fn ensure_vm_deletable_by_owner(db: &Arc<dyn LNVpsDb>, vm_id: u64) -> Resu
 /// stay available until it is resolved.
 async fn v1_delete_vm(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
 ) -> ApiResult<()> {
-    let (_uid, _vm) = get_user_vm(&auth, &this, id).await?;
+    let (uid, _vm) = get_user_vm(&auth, &this, id).await?;
 
     ensure_vm_deletable_by_owner(&this.db, id).await?;
+
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("user", Some(uid), "user.vm.delete")
+                .auth(auth.auth_method(), None)
+                .target("vm", id),
+            &client,
+        ),
+    )
+    .await?;
 
     this.work_sender
         .send(WorkJob::DeleteVm {
@@ -1868,12 +1946,23 @@ struct ReinstallRequest {
 /// Re-install a VM
 async fn v1_reinstall_vm(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     body: Option<Json<ReinstallRequest>>,
 ) -> ApiResult<()> {
     let (uid, mut vm) = get_user_vm(&auth, &this, id).await?;
     let req = body.map(|Json(b)| b).unwrap_or_default();
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        &client,
+        uid,
+        auth.auth_method(),
+        "vm.reinstall",
+        ("vm", id),
+        req.image_id.map(|i| format!("image {i}")),
+    )
+    .await?;
 
     // Reject re-install only on a *genuinely* expired VM (a concrete expiry in
     // the past). Such a VM may already be stopped/removed on the host, so
@@ -2831,6 +2920,7 @@ async fn v1_vm_upgrade(
 ) -> ApiResult<ApiVmPayment> {
     let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
+    enforce_account_limit(AccountAction::Payment, uid).await?;
     let vm = this.db.get_vm(id).await?;
     if vm.user_id != uid {
         return Err(ApiError::forbidden("VM does not belong to you"));
@@ -2960,11 +3050,22 @@ async fn v1_get_firewall_policy(
 /// Update the per-VM default firewall policy
 async fn v1_patch_firewall_policy(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Json(req): Json<PatchVmFirewallPolicy>,
 ) -> ApiResult<ApiVmFirewallPolicy> {
-    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        &client,
+        uid,
+        auth.auth_method(),
+        "vm.firewall.policy.update",
+        ("vm", vm.id),
+        None,
+    )
+    .await?;
 
     let policy_in = match req.policy_in {
         Some(v) => v.map(Into::into),
@@ -2989,11 +3090,22 @@ async fn v1_patch_firewall_policy(
 /// Create a firewall rule for a VM
 async fn v1_create_firewall_rule(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Json(req): Json<CreateVmFirewallRule>,
 ) -> ApiResult<ApiVmFirewallRule> {
-    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        &client,
+        uid,
+        auth.auth_method(),
+        "vm.firewall.rule.create",
+        ("vm", vm.id),
+        None,
+    )
+    .await?;
 
     // Enforce the per-VM rule limit
     let limit = vm_firewall_rule_limit(&this, &vm).await?;
@@ -3039,11 +3151,22 @@ async fn v1_create_firewall_rule(
 /// Update a firewall rule
 async fn v1_patch_firewall_rule(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path((id, rule_id)): Path<(u64, u64)>,
     Json(req): Json<PatchVmFirewallRule>,
 ) -> ApiResult<ApiVmFirewallRule> {
-    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        &client,
+        uid,
+        auth.auth_method(),
+        "vm.firewall.rule.update",
+        ("vm", vm.id),
+        None,
+    )
+    .await?;
 
     let mut rule = this.db.get_vm_firewall_rule(rule_id).await?;
     if rule.vm_id != vm.id {
@@ -3099,10 +3222,21 @@ async fn v1_patch_firewall_rule(
 /// Delete a firewall rule
 async fn v1_delete_firewall_rule(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path((id, rule_id)): Path<(u64, u64)>,
 ) -> ApiResult<()> {
-    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        &client,
+        uid,
+        auth.auth_method(),
+        "vm.firewall.rule.delete",
+        ("vm", vm.id),
+        None,
+    )
+    .await?;
 
     let rule = this.db.get_vm_firewall_rule(rule_id).await?;
     if rule.vm_id != vm.id {
@@ -3865,6 +3999,164 @@ mod tests {
         assert_eq!(line.duration.as_deref(), Some("1 month"));
         // And no VM id is resolvable for the payment.
         assert_eq!(first_vps_vm_id(&db, &[item]).await, None);
+    }
+
+    fn nostr_auth(seed: u8) -> Nip98Auth {
+        use base64::Engine;
+        let keys = nostr::Keys::new(nostr::SecretKey::from_slice(&[seed; 32]).unwrap());
+        let event = nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
+            .sign_with_keys(&keys)
+            .unwrap();
+        Nip98Auth::from_base64(
+            &base64::engine::general_purpose::STANDARD.encode(nostr::JsonUtil::as_json(&event)),
+        )
+        .unwrap()
+    }
+
+    const TEST_SSH_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl test";
+
+    #[tokio::test]
+    async fn firewall_changes_are_audited_and_blocked_when_the_log_fails() {
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        let auth = nostr_auth(5);
+        let uid = db.upsert_user(&auth.pubkey()).await.unwrap();
+        let vm_id = db
+            .insert_vm(&lnvps_db::Vm {
+                user_id: uid,
+                ssh_key_id: None,
+                ..MockDb::mock_vm()
+            })
+            .await
+            .unwrap();
+        db.fail_audit_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let blocked = v1_delete_firewall_rule(
+            auth,
+            ClientInfo::default(),
+            State(state.clone()),
+            Path((vm_id, 1)),
+        )
+        .await;
+        assert!(blocked.is_err());
+        db.fail_audit_writes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = v1_delete_firewall_rule(
+            nostr_auth(5),
+            ClientInfo::default(),
+            State(state),
+            Path((vm_id, 1)),
+        )
+        .await;
+        let log = db.audit_log.lock().await;
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].action, "vm.firewall.rule.delete");
+    }
+
+    #[tokio::test]
+    async fn creating_and_revoking_an_api_token_is_audited() {
+        use crate::api::tokens::*;
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        let created = v1_create_api_token(
+            nostr_auth(6),
+            ClientInfo::default(),
+            State(state.clone()),
+            Json(CreateApiToken {
+                name: "ci".into(),
+                scope: "read".into(),
+                expires_in_days: Some(30),
+            }),
+        )
+        .await
+        .unwrap();
+        let id = created.data.info.id;
+        assert!(created.data.token.starts_with("lnvps_"));
+        let stored = db.api_tokens.lock().await.get(&id).cloned().unwrap();
+        assert_ne!(stored.token_hash, created.data.token);
+        v1_delete_api_token(nostr_auth(6), ClientInfo::default(), State(state), Path(id))
+            .await
+            .unwrap();
+        assert!(db.api_tokens.lock().await.is_empty());
+        let actions: Vec<_> = db
+            .audit_log
+            .lock()
+            .await
+            .iter()
+            .map(|e| e.action.clone())
+            .collect();
+        assert_eq!(actions, vec!["auth.token.create", "auth.token.revoke"]);
+    }
+
+    #[tokio::test]
+    async fn api_token_creation_rejects_bad_scope_and_lifetime() {
+        use crate::api::tokens::*;
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        for (scope, days) in [("admin", 30u64), ("read", 0), ("read", 4000)] {
+            let r = v1_create_api_token(
+                nostr_auth(6),
+                ClientInfo::default(),
+                State(state.clone()),
+                Json(CreateApiToken {
+                    name: "x".into(),
+                    scope: scope.into(),
+                    expires_in_days: Some(days),
+                }),
+            )
+            .await;
+            assert!(r.is_err(), "{scope} {days}");
+        }
+        assert!(db.audit_log.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn adding_an_ssh_key_is_audited() {
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        let auth = nostr_auth(5);
+        v1_add_ssh_key(
+            auth,
+            ClientInfo::default(),
+            State(state),
+            Json(CreateSshKey {
+                name: "laptop".to_string(),
+                key_data: TEST_SSH_KEY.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let log = db.audit_log.lock().await;
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].action, "user.ssh_key.add");
+        assert_eq!(log[0].actor_type, "user");
+        assert_eq!(db.user_ssh_keys.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_write_blocks_adding_an_ssh_key() {
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        db.fail_audit_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let res = v1_add_ssh_key(
+            nostr_auth(5),
+            ClientInfo::default(),
+            State(state),
+            Json(CreateSshKey {
+                name: "laptop".to_string(),
+                key_data: TEST_SSH_KEY.to_string(),
+            }),
+        )
+        .await;
+        assert!(res.is_err());
+        assert!(db.user_ssh_keys.lock().await.is_empty());
     }
 
     #[tokio::test]

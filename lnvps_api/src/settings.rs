@@ -123,7 +123,7 @@ pub struct SessionConfig {
     /// challenge tokens). Must be a strong, stable random string — changing it
     /// invalidates all outstanding sessions.
     pub secret: String,
-    /// Session token lifetime in seconds. Defaults to 30 days.
+    /// Session token lifetime in seconds. Defaults to 7 days.
     #[serde(default = "default_session_ttl")]
     pub ttl: u64,
 }
@@ -654,6 +654,16 @@ pub struct AgentConfig {
     /// source, since a client can always reconnect.
     #[serde(default = "default_agent_anonymous_messages_per_hour")]
     pub anonymous_messages_per_hour: u32,
+
+    /// Where `escalate_to_support` sends a logged-in customer's chat. Needs
+    /// the top-level `smtp` section; without it the tool reports it is off.
+    #[serde(default = "default_agent_support_email")]
+    pub support_email: String,
+}
+
+#[cfg(feature = "agent")]
+pub fn default_agent_support_email() -> String {
+    lnvps_agent::escalation::DEFAULT_SUPPORT_EMAIL.to_string()
 }
 
 /// Default cap on a single chat message (characters).
@@ -706,6 +716,19 @@ pub struct EncryptionConfig {
 
 /// Environment variable holding the hex-encoded database encryption key
 pub const ENCRYPTION_KEY_ENV: &str = "LNVPS_ENCRYPTION_KEY";
+
+pub fn require_encryption_configured(configured: bool) -> anyhow::Result<()> {
+    check_encryption_configured(configured, !cfg!(debug_assertions))
+}
+
+fn check_encryption_configured(configured: bool, release: bool) -> anyhow::Result<()> {
+    if configured || !release {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "no encryption key configured: set {ENCRYPTION_KEY_ENV} or an existing encryption.key-file, refusing to store personal data in plaintext"
+    )
+}
 
 /// Default global maximum prepay window (days) when unspecified in config.
 pub fn default_max_prepay_days() -> u16 {
@@ -762,6 +785,26 @@ pub fn mock_settings() -> Settings {
         webauthn: None,
         session: None,
         app_backups: None,
+    }
+}
+
+#[cfg(test)]
+mod encryption_required_tests {
+    use super::*;
+
+    #[test]
+    fn a_configured_key_is_accepted() {
+        assert!(check_encryption_configured(true, true).is_ok());
+    }
+
+    #[test]
+    fn a_release_build_refuses_to_start_without_a_key() {
+        assert!(check_encryption_configured(false, true).is_err());
+    }
+
+    #[test]
+    fn a_debug_build_may_run_without_a_key() {
+        assert!(check_encryption_configured(false, false).is_ok());
     }
 }
 

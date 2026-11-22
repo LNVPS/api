@@ -20,11 +20,14 @@
 
 use async_openai::types::FunctionObject;
 
-pub mod account;
+mod account;
 pub mod apps;
 pub mod billing;
 pub mod catalogue;
 pub mod diagnostics;
+pub mod errors;
+pub mod escalation;
+pub mod guard;
 pub mod partners;
 pub mod vms;
 
@@ -79,6 +82,7 @@ fn catalogue_tools() -> Vec<FunctionObject> {
         catalogue::price_custom_vm(),
         catalogue::get_exchange_rate(),
         catalogue::list_os_images(),
+        catalogue::list_payment_methods(),
         catalogue::list_apps(),
         catalogue::get_app_details(),
         catalogue::list_app_tags(),
@@ -123,6 +127,7 @@ fn diagnostic_tools() -> Vec<FunctionObject> {
         diagnostics::ping_vm(),
         diagnostics::traceroute_vm(),
         diagnostics::check_vm_port(),
+        diagnostics::scan_vm_ports(),
     ]
 }
 
@@ -171,6 +176,7 @@ pub fn public_tools() -> Vec<FunctionObject> {
 pub fn live_chat_tools() -> Vec<FunctionObject> {
     let mut tools = customer_read_tools();
     tools.extend(power_tools());
+    tools.push(escalation::escalate_to_support());
     tools.extend(diagnostic_tools());
     tools.extend(catalogue_tools());
     tools
@@ -196,6 +202,7 @@ mod tests {
                 "price_custom_vm",
                 "get_exchange_rate",
                 "list_os_images",
+                "list_payment_methods",
                 "list_apps",
                 "get_app_details",
                 "list_app_tags",
@@ -238,7 +245,7 @@ mod tests {
     fn public_tools_exclude_vm_probes() {
         let tools = public_tools();
         let names = names(&tools);
-        for forbidden in ["ping_vm", "traceroute_vm", "check_vm_port"] {
+        for forbidden in ["ping_vm", "traceroute_vm", "check_vm_port", "scan_vm_ports"] {
             assert!(
                 !names.contains(&forbidden),
                 "{forbidden} must not be public"
@@ -246,11 +253,21 @@ mod tests {
         }
     }
 
+    /// The handoff trusts the session's authenticated user, so only live chat
+    /// carries it: email identifies the sender by a forgeable From header and
+    /// Nostr threads are public.
+    #[test]
+    fn escalation_is_offered_only_in_authenticated_live_chat() {
+        assert!(names(&live_chat_tools()).contains(&"escalate_to_support"));
+        assert!(!names(&support_tools()).contains(&"escalate_to_support"));
+        assert!(!names(&public_tools()).contains(&"escalate_to_support"));
+    }
+
     #[test]
     fn customer_sets_include_diagnostics() {
         for set in [support_tools(), live_chat_tools()] {
             let names = names(&set);
-            for expected in ["ping_vm", "traceroute_vm", "check_vm_port"] {
+            for expected in ["ping_vm", "traceroute_vm", "check_vm_port", "scan_vm_ports"] {
                 assert!(names.contains(&expected), "missing {expected}");
             }
         }

@@ -6,6 +6,7 @@ use thiserror::Error;
 
 #[cfg(feature = "admin")]
 mod admin;
+pub mod audit;
 pub mod comma_separated;
 pub mod encrypted_string;
 pub mod encryption;
@@ -19,6 +20,7 @@ pub mod nostr;
 use crate::nostr::LNVPSNostrDb;
 #[cfg(feature = "admin")]
 pub use admin::*;
+pub use audit::{AuditEntry, AuditFilter, NewAuditEntry};
 pub use comma_separated::CommaSeparated;
 pub use encrypted_string::EncryptedString;
 pub use encryption::EncryptionContext;
@@ -180,6 +182,12 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Delete a WebAuthn credential owned by `user_id`. Scoped by user so a
     /// caller can never remove another account's credential.
     async fn delete_webauthn_credential(&self, id: u64, user_id: u64) -> DbResult<()>;
+
+    async fn insert_api_token(&self, token: &ApiToken) -> DbResult<u64>;
+    async fn get_api_token_by_hash(&self, token_hash: &str) -> DbResult<ApiToken>;
+    async fn list_api_tokens(&self, user_id: u64) -> DbResult<Vec<ApiToken>>;
+    async fn delete_api_token(&self, id: u64, user_id: u64) -> DbResult<()>;
+    async fn touch_api_token(&self, id: u64, ip: Option<&str>) -> DbResult<()>;
 
     /// Get a user by id
     async fn get_user(&self, id: u64) -> DbResult<User>;
@@ -946,6 +954,15 @@ pub trait LNVpsDbBase: Send + Sync {
         compacted_upto: u64,
     ) -> DbResult<()>;
 
+    /// Record that the agent emailed a conversation to support: stamps the
+    /// time, bumps the counter and keeps the latest reason and VM ids.
+    async fn record_agent_escalation(
+        &self,
+        conversation_id: u64,
+        reason: &str,
+        vm_ids: &str,
+    ) -> DbResult<()>;
+
     /// Execute a raw SQL query that doesn't return data
     async fn execute_query(&self, query: &str) -> DbResult<u64>;
 
@@ -1524,6 +1541,15 @@ pub trait LNVpsDbBase: Send + Sync {
         offset: u64,
     ) -> DbResult<(Vec<AccountCreditEvent>, u64)>;
 
+    /// Every ledger event of `kind` in `currency` created at or after `since`,
+    /// across all users, oldest first.
+    async fn list_account_credit_events_by_kind(
+        &self,
+        kind: &str,
+        currency: &str,
+        since: DateTime<Utc>,
+    ) -> DbResult<Vec<AccountCreditEvent>>;
+
     /// Hold `debit.amount` of the user's balance until `debit.expires`.
     /// Returns the debit id, or `None` when the unreserved balance is short.
     async fn reserve_account_credit(&self, debit: &AccountCreditDebit) -> DbResult<Option<u64>>;
@@ -1541,7 +1567,36 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn get_account_credit_debit_by_payment(
         &self,
         subscription_payment_id: &Vec<u8>,
-    ) -> DbResult<Option<AccountCreditDebit>>;
+    ) -> DbResult<Option<AccountCreditDebit>> {
+        Ok(self
+            .list_account_credit_debits_by_payment(subscription_payment_id)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Every debit held against a payment: one per balance currency when the
+    /// bill was covered by several balances.
+    async fn list_account_credit_debits_by_payment(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Vec<AccountCreditDebit>>;
+
+    /// Spend every unsettled debit on a payment. Each is settled on its own, so
+    /// a retry after a failure resumes with the ones left.
+    async fn settle_account_credit_debits(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Vec<AccountCreditDebit>> {
+        let mut settled = Vec::new();
+        while let Some(d) = self
+            .settle_account_credit_debit(subscription_payment_id)
+            .await?
+        {
+            settled.push(d);
+        }
+        Ok(settled)
+    }
 
     /// Spend the debit on a payment. Idempotent: returns `None` when there is
     /// no unsettled debit. An expired reservation may find its credit promised
@@ -1893,6 +1948,26 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Total cost of orders that have committed money (ordering, ordered or
     /// delivered) at or after `since`, in `currency`.
     async fn sum_ip_order_cost_since(&self, since: DateTime<Utc>, currency: &str) -> DbResult<u64>;
+    async fn transform_column_batch(
+        &self,
+        table: &str,
+        id_expr: &str,
+        column: &str,
+        skip_prefix: &str,
+        limit: u64,
+        transform: &(dyn for<'a> Fn(&'a str) -> anyhow::Result<Option<String>> + Send + Sync),
+    ) -> DbResult<u64>;
+    async fn append_audit(&self, entry: NewAuditEntry) -> DbResult<AuditEntry>;
+    async fn list_audit(
+        &self,
+        filter: &AuditFilter,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<Vec<AuditEntry>>;
+    /// Truncate the stored IP on audit rows older than `days` to /24 (IPv4) or /48 (IPv6).
+    /// The row hash covers the truncated form, so the chain stays valid. Returns rows changed.
+    async fn truncate_audit_ips(&self, days: u32) -> DbResult<u64>;
+    async fn audit_range(&self, after_id: u64, limit: u64) -> DbResult<Vec<AuditEntry>>;
     async fn insert_ip_order_audit(
         &self,
         ip_order_id: u64,

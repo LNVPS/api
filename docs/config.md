@@ -290,8 +290,13 @@ precedence):
      auto-generate: true   # generate key if absent
    ```
 
-When neither is provided, field encryption is disabled and values are
-stored/read as plaintext.
+Release builds refuse to start when neither is provided, and `auto-generate`
+only works in debug builds. Debug builds without a key store values as plaintext.
+
+To rotate: set `LNVPS_ENCRYPTION_KEY` to the new key and
+`LNVPS_ENCRYPTION_KEY_PREVIOUS` to the old one(s), deploy, run
+`rotate_encryption_key`, then drop the previous key. See
+`docs/security/threat-model.md`.
 
 Encrypted fields: SSH key material, NWC connection strings, email addresses, host API tokens.
 

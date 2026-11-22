@@ -80,12 +80,35 @@ async fn main() -> Result<(), Error> {
         info!("Database encryption initialized from key file");
     }
 
+    if let Some(session) = &settings.session {
+        lnvps_api_common::init_session_secret(session.secret.as_bytes().to_vec());
+    }
+    if settings.require_step_up && settings.session.is_none() {
+        anyhow::bail!("require-step-up needs a session secret to verify step-up tokens");
+    }
+    lnvps_api_common::set_step_up_required(settings.require_step_up);
+
     // Connect database and migrate
     let db = LNVpsDbMysql::new(&settings.db).await?;
     db.migrate().await?;
     let db: Arc<dyn LNVpsDb> = Arc::new(db);
 
     // Initialize VM state cache
+    if let Some(redis_config) = &settings.redis {
+        lnvps_api_common::install_shared_seen_set(std::sync::Arc::new(
+            lnvps_api_common::RedisSeenSet::new(&redis_config.url).await?,
+        ));
+    }
+    {
+        let store: std::sync::Arc<dyn lnvps_api_common::CounterStore> = match &settings.redis {
+            Some(r) => std::sync::Arc::new(lnvps_api_common::RedisCounterStore::new(&r.url).await?),
+            None => std::sync::Arc::new(lnvps_api_common::MemoryCounterStore::default()),
+        };
+        lnvps_api_common::install_account_limiter(lnvps_api_common::AccountLimiter::new(
+            store,
+            settings.rate_limit.enabled,
+        ));
+    }
     let vm_state_cache = if let Some(redis_config) = &settings.redis {
         VmStateCache::new_with_redis(redis_config.clone()).await?
     } else {

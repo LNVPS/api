@@ -121,7 +121,10 @@ async fn main() -> Result<(), Error> {
     // Initialize encryption: prefer the environment variable, otherwise fall
     // back to the key file configured in settings.
     if let Ok(hex_key) = std::env::var(lnvps_api::settings::ENCRYPTION_KEY_ENV) {
-        EncryptionContext::init_from_hex(&hex_key)?;
+        EncryptionContext::init_from_hex_with_previous(
+            &hex_key,
+            &lnvps_db::encryption::previous_keys_from_env(),
+        )?;
         info!("Database encryption initialized from environment");
     } else if let Some(ref encryption_config) = settings.encryption {
         EncryptionContext::init_from_file(
@@ -130,6 +133,7 @@ async fn main() -> Result<(), Error> {
         )?;
         info!("Database encryption initialized from key file");
     }
+    lnvps_api::settings::require_encryption_configured(EncryptionContext::get().is_ok())?;
 
     // Connect database and migrate
     let db = LNVpsDbMysql::new(&settings.db).await?;
@@ -240,6 +244,21 @@ async fn main() -> Result<(), Error> {
         None => None,
     };
 
+    if let Some(redis_config) = &settings.redis {
+        lnvps_api_common::install_shared_seen_set(std::sync::Arc::new(
+            lnvps_api_common::RedisSeenSet::new(&redis_config.url).await?,
+        ));
+    }
+    {
+        let store: std::sync::Arc<dyn lnvps_api_common::CounterStore> = match &settings.redis {
+            Some(r) => std::sync::Arc::new(lnvps_api_common::RedisCounterStore::new(&r.url).await?),
+            None => std::sync::Arc::new(lnvps_api_common::MemoryCounterStore::default()),
+        };
+        lnvps_api_common::install_account_limiter(lnvps_api_common::AccountLimiter::new(
+            store,
+            settings.rate_limit.enabled,
+        ));
+    }
     let status = if let Some(redis_config) = &settings.redis {
         VmStateCache::new_with_redis(redis_config.clone()).await?
     } else {

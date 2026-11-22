@@ -140,6 +140,7 @@ fn auth(action: AdminAction) -> AdminAuth {
         .into_iter()
         .collect(),
         nip98_auth: None,
+        step_up: false,
     }
 }
 
@@ -149,6 +150,7 @@ fn no_permissions() -> AdminAuth {
         pubkey: vec![1u8; 32],
         permissions: Default::default(),
         nip98_auth: None,
+        step_up: false,
     }
 }
 

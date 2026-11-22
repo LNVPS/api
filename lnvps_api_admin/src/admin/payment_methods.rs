@@ -265,6 +265,7 @@ mod tests {
                 })
                 .collect(),
             nip98_auth: None,
+            step_up: false,
         }
     }
 

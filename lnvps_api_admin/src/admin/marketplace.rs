@@ -753,6 +753,7 @@ mod tests {
             .map(|action| Permission { resource, action })
             .collect(),
             nip98_auth: None,
+            step_up: false,
         }
     }
 

@@ -111,6 +111,29 @@ impl DbToolExecutor {
                 json!(host.map(|h| json!({ "name": h.name, "kind": h.kind.to_string() }))),
             );
             object.insert("ssh_host_keys".to_string(), json!(vm.ssh_host_keys));
+            let installed_key = match vm.ssh_key_id {
+                Some(id) => self.db.get_user_ssh_key(id).await.ok(),
+                None => None,
+            };
+            object.insert(
+                "installed_key".to_string(),
+                json!(installed_key.map(|k| json!({ "id": k.id, "name": k.name }))),
+            );
+            let image = self.db.get_os_image(vm.image_id).await.ok();
+            object.insert(
+                "default_login_user".to_string(),
+                json!(image.and_then(|i| i.default_username)),
+            );
+            let reverse_dns: Vec<Value> = self
+                .db
+                .list_vm_ip_assignments(vm.id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|a| !a.deleted)
+                .map(|a| json!({ "ip": a.ip, "forward_dns": a.dns_forward, "reverse_dns": a.dns_reverse }))
+                .collect();
+            object.insert("dns_records".to_string(), Value::Array(reverse_dns));
             object.insert(
                 "custom_template_id".to_string(),
                 json!(vm.custom_template_id),
@@ -197,6 +220,13 @@ impl DbToolExecutor {
 
     /// Apply a power action to an owned VM.
     pub(super) async fn power(&self, vm: &Vm, action: PowerAction) -> Result<Value> {
+        if vm.disabled && action != PowerAction::Stop {
+            bail!(
+                "VM {} was disabled by LNVPS staff, so it cannot be {}. This is not a fault the customer or the agent can clear: send them to support@lnvps.net and do not retry.",
+                vm.id,
+                action.as_str()
+            );
+        }
         let (Some(provisioner), Some(work_sender)) =
             (self.provisioner.as_ref(), self.work_sender.as_ref())
         else {
@@ -339,6 +369,59 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_staff_disabled_vm_cannot_be_started_or_restarted() {
+        let (db, exec) = executor(1).await;
+        seed_vm(&db, 5, 1).await;
+        db.vms.lock().await.get_mut(&5).unwrap().disabled = true;
+        for tool in ["start_vm", "restart_vm"] {
+            let err = exec
+                .execute(tool, r#"{"vm_id":5}"#)
+                .await
+                .expect_err("disabled VM must be refused");
+            assert!(
+                err.to_string().contains("disabled by LNVPS staff"),
+                "{tool}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn vm_details_name_the_installed_key_login_user_and_dns() {
+        let (db, exec) = executor(1).await;
+        seed_vm(&db, 5, 1).await;
+        db.vms.lock().await.get_mut(&5).unwrap().ssh_key_id = Some(9);
+        db.user_ssh_keys.lock().await.insert(
+            9,
+            lnvps_db::UserSshKey {
+                id: 9,
+                name: "laptop".to_string(),
+                user_id: 1,
+                created: chrono::Utc::now(),
+                key_data: "ssh-ed25519 SECRET-KEY-BLOB".to_string().into(),
+            },
+        );
+        db.ip_assignments.lock().await.insert(
+            1,
+            lnvps_db::VmIpAssignment {
+                id: 1,
+                vm_id: 5,
+                ip: "185.18.221.5".to_string(),
+                dns_reverse: Some("mail.example.com".to_string()),
+                ..Default::default()
+            },
+        );
+        let out = exec
+            .execute("get_vm_details", r#"{"vm_id":5}"#)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["installed_key"]["name"], "laptop");
+        assert!(parsed["default_login_user"].is_string() || parsed["default_login_user"].is_null());
+        assert_eq!(parsed["dns_records"][0]["reverse_dns"], "mail.example.com");
+        assert!(!out.contains("SECRET-KEY-BLOB"));
     }
 
     #[tokio::test]

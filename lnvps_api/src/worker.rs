@@ -142,6 +142,8 @@ const NEVER_PAID_SUBSCRIPTION_TTL: TimeDelta = TimeDelta::hours(24);
 /// still missing keys.
 const HOST_KEY_SCAN_RETRY_SECS: u64 = 3600;
 
+const HOST_KEY_NEW_VM_WINDOW: TimeDelta = TimeDelta::minutes(30);
+
 /// Key holding when a VM's host keys were last scanned.
 fn host_key_attempt_key(vm_id: u64) -> String {
     format!("worker-host-keys-attempt-{vm_id}")
@@ -1799,7 +1801,9 @@ impl Worker {
         // check for the life of the VM. One attempt per hour still captures
         // the keys within an hour of the guest becoming reachable.
         let attempt_key = host_key_attempt_key(vm.id);
-        if let Ok(Some(v)) = self.kv.get(&attempt_key).await
+        let fresh = captured.is_empty() && self.vm_booted_recently(vm.id).await;
+        if !fresh
+            && let Ok(Some(v)) = self.kv.get(&attempt_key).await
             && v.len() == 8
         {
             let last = u64::from_le_bytes(v.as_slice().try_into().unwrap_or_default());
@@ -1846,6 +1850,24 @@ impl Worker {
         if let Err(e) = self.db.set_vm_ssh_host_keys(vm.id, Some(&merged)).await {
             warn!("[host-keys] vm {}: failed to store keys: {}", vm.id, e);
         }
+    }
+
+    async fn vm_booted_recently(&self, vm_id: u64) -> bool {
+        let cutoff = Utc::now() - HOST_KEY_NEW_VM_WINDOW;
+        self.db
+            .list_vm_history(vm_id)
+            .await
+            .map(|history| {
+                history.iter().any(|h| {
+                    matches!(
+                        h.action_type,
+                        VmHistoryActionType::Created
+                            | VmHistoryActionType::Started
+                            | VmHistoryActionType::Reinstalled
+                    ) && h.timestamp >= cutoff
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// The address to scan a VM's host keys on: its first assigned IP, v4
@@ -3783,6 +3805,13 @@ impl Worker {
                     .await?;
                 if ips > 0 {
                     info!("Cleared {} expired user IP addresses", ips);
+                }
+                let audit_ips = self
+                    .db
+                    .truncate_audit_ips(lnvps_db::audit::IP_RETENTION_DAYS)
+                    .await?;
+                if audit_ips > 0 {
+                    info!("Truncated {} audit log IP addresses", audit_ips);
                 }
                 let cases = self.db.purge_abuse_cases().await?;
                 if cases > 0 {
@@ -5876,6 +5905,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn purge_job_truncates_old_audit_ips_and_keeps_the_chain_valid() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        {
+            let mut log = db.audit_log.lock().await;
+            for (i, (ip, age)) in [("203.0.113.77", 120i64), ("198.51.100.9", 5)]
+                .into_iter()
+                .enumerate()
+            {
+                let prev = log
+                    .last()
+                    .map(|e| e.hash.clone())
+                    .unwrap_or_else(|| lnvps_db::audit::GENESIS_HASH.to_string());
+                let mut entry = lnvps_db::NewAuditEntry::new("user", Some(1), "auth.login");
+                entry.ip = Some(ip.to_string());
+                log.push(lnvps_db::AuditEntry::seal(
+                    i as u64 + 1,
+                    (Utc::now() - TimeDelta::days(age)).timestamp(),
+                    &prev,
+                    entry,
+                ));
+            }
+        }
+        let worker = setup_worker(db.clone()).await?;
+        worker.try_job(&WorkJob::PurgeExpiredRecords).await?;
+        let rows = db.audit_range(0, 10).await?;
+        assert_eq!(rows[0].ip.as_deref(), Some("203.0.113.0"));
+        assert_eq!(rows[1].ip.as_deref(), Some("198.51.100.9"));
+        assert!(lnvps_db::audit::verify_chain(&rows, None).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn purge_job_also_drops_abuse_cases_a_year_after_closing() -> Result<()> {
         let db = Arc::new(MockDb::default());
         {
@@ -6905,6 +6966,95 @@ mod tests {
             worker.kv.get(&host_key_attempt_key(vm_id)).await?.is_some(),
             "periodic sweep did not attempt host key capture"
         );
+        Ok(())
+    }
+
+    async fn host_key_retry_stamp_after_pass(
+        age_of_vm: Option<TimeDelta>,
+        action: VmHistoryActionType,
+    ) -> Result<(u64, u64)> {
+        let db = Arc::new(MockDb::default());
+        db.hosts
+            .lock()
+            .await
+            .get_mut(&1)
+            .expect("mock host")
+            .ssh_key = Some(lnvps_db::EncryptedString::from("not-a-usable-key"));
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        db.insert_vm_ip_assignment(&VmIpAssignment {
+            vm_id,
+            ip_range_id: 1,
+            ip: "10.0.0.5".to_string(),
+            ..Default::default()
+        })
+        .await?;
+        if let Some(age) = age_of_vm {
+            db.insert_vm_history(&lnvps_db::VmHistory {
+                id: 0,
+                vm_id,
+                action_type: action,
+                timestamp: Utc::now() - age,
+                initiated_by_user: None,
+                previous_state: None,
+                new_state: None,
+                metadata: None,
+                description: None,
+            })
+            .await?;
+        }
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .vm_state_cache
+            .set_state(
+                vm_id,
+                VmRunningState {
+                    state: VmRunningStates::Running,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let earlier = (Utc::now().timestamp() - 60) as u64;
+        worker
+            .kv
+            .store(&host_key_attempt_key(vm_id), &earlier.to_le_bytes())
+            .await?;
+
+        let vm = db.get_vm(vm_id).await?;
+        let host = db.get_host(vm.host_id).await?;
+        worker
+            .capture_vm_ssh_host_keys(&vm, &host, &mut HostSshSession::default())
+            .await;
+
+        let stamp = worker.kv.get(&host_key_attempt_key(vm_id)).await?.unwrap();
+        Ok((earlier, u64::from_le_bytes(stamp.as_slice().try_into()?)))
+    }
+
+    #[tokio::test]
+    async fn test_new_vm_without_host_keys_is_rescanned_every_pass() -> Result<()> {
+        for action in [
+            VmHistoryActionType::Created,
+            VmHistoryActionType::Reinstalled,
+        ] {
+            let (earlier, stamp) =
+                host_key_retry_stamp_after_pass(Some(TimeDelta::minutes(2)), action).await?;
+            assert!(
+                stamp > earlier,
+                "a VM that booted minutes ago must be rescanned despite a scan a minute ago"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_old_vm_without_host_keys_backs_off_hourly() -> Result<()> {
+        for age in [None, Some(TimeDelta::hours(2))] {
+            let (earlier, stamp) =
+                host_key_retry_stamp_after_pass(age, VmHistoryActionType::Created).await?;
+            assert_eq!(
+                stamp, earlier,
+                "an old VM must wait out the hourly back-off"
+            );
+        }
         Ok(())
     }
 
@@ -8952,7 +9102,7 @@ mod tests {
             let mut users = db.users.lock().await;
             let u = users.get_mut(&reachable).unwrap();
             u.contact_nip17 = true;
-            u.billing_name = Some("Nostr Owner".to_string());
+            u.billing_name = Some("Nostr Owner".into());
             users.get_mut(&other_host_owner).unwrap().contact_nip17 = true;
         }
         {

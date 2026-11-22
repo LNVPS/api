@@ -14,8 +14,84 @@ use anyhow::{Result, bail};
 use log::warn;
 use std::collections::HashMap;
 use std::hash::Hash;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+
+#[async_trait::async_trait]
+pub trait SharedSeenSet: Send + Sync {
+    async fn first_use(&self, key: &str, ttl: Duration) -> Result<bool>;
+}
+
+#[derive(Default)]
+pub struct MemorySeenSet {
+    seen: Mutex<HashMap<String, Instant>>,
+}
+
+#[async_trait::async_trait]
+impl SharedSeenSet for MemorySeenSet {
+    async fn first_use(&self, key: &str, ttl: Duration) -> Result<bool> {
+        let now = Instant::now();
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        seen.retain(|_, at| now.duration_since(*at) < ttl);
+        Ok(seen.insert(key.to_string(), now).is_none())
+    }
+}
+
+pub struct RedisSeenSet {
+    conn: redis::aio::ConnectionManager,
+}
+
+impl RedisSeenSet {
+    pub async fn new(url: &str) -> Result<Self> {
+        let client = redis::Client::open(url)?;
+        Ok(Self {
+            conn: redis::aio::ConnectionManager::new(client).await?,
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl SharedSeenSet for RedisSeenSet {
+    async fn first_use(&self, key: &str, ttl: Duration) -> Result<bool> {
+        let mut conn = self.conn.clone();
+        let reply: Option<String> = redis::cmd("SET")
+            .arg(format!("seen:{key}"))
+            .arg(1)
+            .arg("NX")
+            .arg("EX")
+            .arg(ttl.as_secs().max(1))
+            .query_async(&mut conn)
+            .await?;
+        Ok(reply.is_some())
+    }
+}
+
+static SHARED_SEEN_SET: OnceLock<Arc<dyn SharedSeenSet>> = OnceLock::new();
+
+pub fn install_shared_seen_set(set: Arc<dyn SharedSeenSet>) -> bool {
+    SHARED_SEEN_SET.set(set).is_ok()
+}
+
+pub async fn consume_shared(
+    set: Option<&Arc<dyn SharedSeenSet>>,
+    label: &str,
+    key: &str,
+    ttl: Duration,
+) -> Result<()> {
+    let Some(set) = set else { return Ok(()) };
+    match set.first_use(&format!("{label}:{key}"), ttl).await {
+        Ok(true) => Ok(()),
+        Ok(false) => bail!("Credential has already been used"),
+        Err(e) => {
+            warn!("shared {label} set unavailable, using the local set only: {e}");
+            Ok(())
+        }
+    }
+}
+
+pub async fn consume_installed(label: &str, key: &str, ttl: Duration) -> Result<()> {
+    consume_shared(SHARED_SEEN_SET.get(), label, key, ttl).await
+}
 
 /// Tracks recently-used credential identifiers.
 pub struct SingleUseGuard<K> {
@@ -130,6 +206,42 @@ mod tests {
             "cache grew past its capacity: {}",
             guard.len()
         );
+    }
+
+    #[tokio::test]
+    async fn a_shared_set_rejects_a_replay_seen_by_another_replica() {
+        let shared: Arc<dyn SharedSeenSet> = Arc::new(MemorySeenSet::default());
+        let replica_a: SingleUseGuard<u32> = SingleUseGuard::new("a", Duration::from_secs(60), 10);
+        let replica_b: SingleUseGuard<u32> = SingleUseGuard::new("b", Duration::from_secs(60), 10);
+        let ttl = Duration::from_secs(60);
+        replica_a.consume(7).unwrap();
+        consume_shared(Some(&shared), "nip98", "7", ttl).await.unwrap();
+        replica_b.consume(7).unwrap();
+        assert!(consume_shared(Some(&shared), "nip98", "7", ttl).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn two_replicas_on_one_redis_reject_a_replayed_nip98_event() {
+        let Ok(url) = std::env::var("LNVPS_TEST_REDIS_URL") else {
+            return;
+        };
+        let a: Arc<dyn SharedSeenSet> = Arc::new(RedisSeenSet::new(&url).await.unwrap());
+        let b: Arc<dyn SharedSeenSet> = Arc::new(RedisSeenSet::new(&url).await.unwrap());
+        let ttl = Duration::from_secs(5);
+        let id = format!("replay-{}", std::process::id());
+        consume_shared(Some(&a), "nip98", &id, ttl).await.unwrap();
+        assert!(consume_shared(Some(&b), "nip98", &id, ttl).await.is_err());
+        assert!(consume_shared(Some(&a), "nip98", &id, ttl).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn redis_set_is_shared_when_available() {
+        let Ok(url) = std::env::var("LNVPS_TEST_REDIS_URL") else { return };
+        let a = RedisSeenSet::new(&url).await.unwrap();
+        let b = RedisSeenSet::new(&url).await.unwrap();
+        let key = format!("test-{}", std::process::id());
+        assert!(a.first_use(&key, Duration::from_secs(5)).await.unwrap());
+        assert!(!b.first_use(&key, Duration::from_secs(5)).await.unwrap());
     }
 
     #[test]

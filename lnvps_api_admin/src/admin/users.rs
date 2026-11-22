@@ -180,25 +180,25 @@ async fn admin_update_user(
             .map(|c| c.alpha3().to_string());
     }
     if let Some(billing_name) = &req.billing_name {
-        user.billing_name = Some(billing_name.clone());
+        user.billing_name = Some(billing_name.as_str().into());
     }
     if let Some(billing_address_1) = &req.billing_address_1 {
-        user.billing_address_1 = Some(billing_address_1.clone());
+        user.billing_address_1 = Some(billing_address_1.as_str().into());
     }
     if let Some(billing_address_2) = &req.billing_address_2 {
-        user.billing_address_2 = Some(billing_address_2.clone());
+        user.billing_address_2 = Some(billing_address_2.as_str().into());
     }
     if let Some(billing_city) = &req.billing_city {
-        user.billing_city = Some(billing_city.clone());
+        user.billing_city = Some(billing_city.as_str().into());
     }
     if let Some(billing_state) = &req.billing_state {
-        user.billing_state = Some(billing_state.clone());
+        user.billing_state = Some(billing_state.as_str().into());
     }
     if let Some(billing_postcode) = &req.billing_postcode {
-        user.billing_postcode = Some(billing_postcode.clone());
+        user.billing_postcode = Some(billing_postcode.as_str().into());
     }
     if let Some(billing_tax_id) = &req.billing_tax_id {
-        user.billing_tax_id = Some(billing_tax_id.clone());
+        user.billing_tax_id = Some(billing_tax_id.as_str().into());
     }
     // IP-resolved geolocation evidence. Editing either field bumps geo_updated
     // to reflect the manual override time.
@@ -406,6 +406,7 @@ mod tax_tests {
             .into_iter()
             .collect(),
             nip98_auth: None,
+            step_up: false,
         }
     }
 
@@ -422,7 +423,7 @@ mod tax_tests {
         let user_id = db.upsert_user(&[9u8; 32]).await.unwrap();
         let mut user = db.get_user(user_id).await.unwrap();
         user.country_code = declared.map(str::to_string);
-        user.billing_tax_id = vat_number.map(str::to_string);
+        user.billing_tax_id = vat_number.map(Into::into);
         db.update_user(&user).await.unwrap();
         (db, user_id)
     }
@@ -532,6 +533,7 @@ mod tax_tests {
             .into_iter()
             .collect(),
             nip98_auth: None,
+            step_up: false,
         };
 
         assert!(
