@@ -48,6 +48,32 @@ pub struct GatewayInvoice {
     pub external_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct GatewaySavedCharge {
+    pub payment_id: Vec<u8>,
+    pub gateway_method_id: u64,
+    pub amount: u64,
+    pub currency: String,
+    pub tax: u64,
+    pub description: String,
+    pub customer_ref: String,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayCharge {
+    pub external_id: String,
+    pub paid: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct GatewayImportMethod {
+    pub customer_ref: String,
+    pub provider: String,
+    pub external_customer_id: String,
+    pub external_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayEvent {
     pub event_id: String,
@@ -61,6 +87,18 @@ pub trait PaymentGateway: Send + Sync {
     async fn create_lightning_invoice(&self, req: GatewayInvoiceRequest) -> Result<GatewayInvoice>;
 
     async fn cancel(&self, external_id: Option<&str>, payment_id: &[u8]) -> Result<()>;
+
+    async fn charge_saved_method(&self, _req: GatewaySavedCharge) -> Result<GatewayCharge> {
+        bail!("saved methods are not supported by this gateway")
+    }
+
+    async fn delete_saved_method(&self, _gateway_method_id: u64) -> Result<()> {
+        bail!("saved methods are not supported by this gateway")
+    }
+
+    async fn import_saved_method(&self, _req: GatewayImportMethod) -> Result<u64> {
+        bail!("saved methods are not supported by this gateway")
+    }
 }
 
 pub struct GatewayClient {
@@ -120,6 +158,35 @@ impl PaymentGateway for GatewayClient {
         self.client.cancel_payment(id).await?;
         Ok(())
     }
+
+    async fn charge_saved_method(&self, req: GatewaySavedCharge) -> Result<GatewayCharge> {
+        let reference = hex::encode(&req.payment_id);
+        let mut input = CreatePayment::new(req.amount, &req.currency).reference(&reference);
+        input.tax = Some(req.tax.min(req.amount));
+        input.description = Some(req.description);
+        input.customer_ref = Some(req.customer_ref);
+        input.metadata = Some(req.metadata);
+        let payment = self
+            .client
+            .charge_saved_method_with_key(req.gateway_method_id, &input, &reference)
+            .await
+            .context("gateway charge_saved_method failed")?;
+        Ok(GatewayCharge {
+            external_id: format!("{GATEWAY_EXTERNAL_ID_PREFIX}{}", payment.id),
+            paid: payment.status == "paid",
+        })
+    }
+
+    async fn delete_saved_method(&self, gateway_method_id: u64) -> Result<()> {
+        self.client
+            .delete_saved_method(gateway_method_id)
+            .await
+            .context("gateway delete_saved_method failed")
+    }
+
+    async fn import_saved_method(&self, _req: GatewayImportMethod) -> Result<u64> {
+        bail!("importing saved methods is not supported by the pinned payment gateway client")
+    }
 }
 
 pub fn is_gateway_payment(external_id: Option<&str>) -> bool {
@@ -154,6 +221,11 @@ pub struct FakeGateway {
     pub created: Mutex<Vec<GatewayInvoiceRequest>>,
     pub cancelled: Mutex<Vec<String>>,
     pub fail: Mutex<bool>,
+    pub charges: Mutex<Vec<GatewaySavedCharge>>,
+    pub deleted_methods: Mutex<Vec<u64>>,
+    pub imported: Mutex<Vec<GatewayImportMethod>>,
+    pub fail_charges: Mutex<bool>,
+    pub charge_leaves_pending: Mutex<bool>,
     ids: Mutex<HashMap<Vec<u8>, String>>,
 }
 
@@ -192,6 +264,39 @@ impl PaymentGateway for FakeGateway {
         };
         self.cancelled.lock().unwrap().push(id.to_string());
         Ok(())
+    }
+
+    async fn charge_saved_method(&self, req: GatewaySavedCharge) -> Result<GatewayCharge> {
+        if *self.fail_charges.lock().unwrap() {
+            bail!("card declined");
+        }
+        let gateway_id = format!(
+            "gw{}",
+            hex::encode(&req.payment_id[..4.min(req.payment_id.len())])
+        );
+        self.ids
+            .lock()
+            .unwrap()
+            .insert(req.payment_id.clone(), gateway_id.clone());
+        self.charges.lock().unwrap().push(req);
+        Ok(GatewayCharge {
+            external_id: format!("{GATEWAY_EXTERNAL_ID_PREFIX}{gateway_id}"),
+            paid: !*self.charge_leaves_pending.lock().unwrap(),
+        })
+    }
+
+    async fn delete_saved_method(&self, gateway_method_id: u64) -> Result<()> {
+        if *self.fail.lock().unwrap() {
+            bail!("gateway unavailable");
+        }
+        self.deleted_methods.lock().unwrap().push(gateway_method_id);
+        Ok(())
+    }
+
+    async fn import_saved_method(&self, req: GatewayImportMethod) -> Result<u64> {
+        let mut imported = self.imported.lock().unwrap();
+        imported.push(req);
+        Ok(100 + imported.len() as u64)
     }
 }
 

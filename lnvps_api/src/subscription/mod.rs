@@ -283,6 +283,7 @@ pub struct SubscriptionHandler {
 
     node: Arc<dyn LightningNode>,
     lightning_gateway: Arc<dyn PaymentGateway>,
+    card_gateway: Option<Arc<dyn PaymentGateway>>,
     onchain: Arc<dyn OnChainProvider>,
     revolut: Option<Arc<dyn FiatPaymentService>>,
     swap: Option<Arc<dyn SwapProvider>>,
@@ -315,6 +316,7 @@ impl SubscriptionHandler {
         Ok(Self {
             revolut,
             swap: None,
+            card_gateway: None,
             lightning_gateway: Arc::new(crate::payments::gateway::InProcessGateway::new(
                 node.clone(),
             )),
@@ -515,6 +517,15 @@ impl SubscriptionHandler {
 
     pub fn lightning_gateway(&self) -> Arc<dyn PaymentGateway> {
         self.lightning_gateway.clone()
+    }
+
+    pub fn card_gateway(&self) -> Option<Arc<dyn PaymentGateway>> {
+        self.card_gateway.clone()
+    }
+
+    pub fn with_card_gateway(mut self, gateway: Arc<dyn PaymentGateway>) -> Self {
+        self.card_gateway = Some(gateway);
+        self
     }
 
     pub fn with_lightning_gateway(mut self, gateway: Arc<dyn PaymentGateway>) -> Self {
