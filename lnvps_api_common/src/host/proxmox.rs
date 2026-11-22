@@ -3946,20 +3946,14 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("DELETE"))
-            .and(path_regex(
-                r".*/qemu/101/firewall/ipset/ipfilter-net0/10\.9\.9\.244$",
-            ))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})),
-            )
+            .and(path_regex(r".*/qemu/101/firewall/ipset/ipfilter-net0/10\.9\.9\.244$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})))
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path_regex(r".*/qemu/101/firewall/ipset/ipfilter-net0$"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})))
             .expect(1)
             .mount(&server)
             .await;

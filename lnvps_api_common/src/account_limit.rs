@@ -182,10 +182,7 @@ mod tests {
         for _ in 0..3 {
             l.check_with(AccountAction::VmOrder, 1, 3).await.unwrap();
         }
-        let err = l
-            .check_with(AccountAction::VmOrder, 1, 3)
-            .await
-            .unwrap_err();
+        let err = l.check_with(AccountAction::VmOrder, 1, 3).await.unwrap_err();
         assert_eq!(err.code, StatusCode::TOO_MANY_REQUESTS);
         l.check_with(AccountAction::VmOrder, 2, 3).await.unwrap();
         l.check_with(AccountAction::Payment, 1, 3).await.unwrap();

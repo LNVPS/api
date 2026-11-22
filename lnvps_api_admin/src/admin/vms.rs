@@ -1271,8 +1271,7 @@ async fn admin_process_vm_refund(
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
     auth.require_permission(AdminResource::Payments, AdminAction::Update)?;
     auth.require_step_up()?;
-    lnvps_api_common::enforce_account_limit(lnvps_api_common::AccountAction::Refund, auth.user_id)
-        .await?;
+    lnvps_api_common::enforce_account_limit(lnvps_api_common::AccountAction::Refund, auth.user_id).await?;
 
     // Verify VM exists
     let _vm = this.db.get_vm(vm_id).await?;
@@ -1418,8 +1417,7 @@ async fn admin_record_payment_refund(
     // Money leaving the business is a payments write, like completing one.
     auth.require_permission(AdminResource::Payments, AdminAction::Update)?;
     auth.require_step_up()?;
-    lnvps_api_common::enforce_account_limit(lnvps_api_common::AccountAction::Refund, auth.user_id)
-        .await?;
+    lnvps_api_common::enforce_account_limit(lnvps_api_common::AccountAction::Refund, auth.user_id).await?;
 
     let vm = this.db.get_vm(vm_id).await?;
     let payment = load_vm_payment(&this, &vm, &payment_id).await?;
@@ -2949,10 +2947,7 @@ mod audit_tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            f.audit_actions().await,
-            vec!["admin.vm.transfer", "vm.history.transferred"]
-        );
+        assert_eq!(f.audit_actions().await, vec!["admin.vm.transfer", "vm.history.transferred"]);
         assert_eq!(f.mock.get_vm(f.vm_id).await.unwrap().user_id, to);
     }
 

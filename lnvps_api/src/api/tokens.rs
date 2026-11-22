@@ -70,9 +70,7 @@ pub async fn v1_create_api_token(
     }
     let uid = this.db.upsert_user(&auth.pubkey()).await?;
     if this.db.list_api_tokens(uid).await?.len() >= MAX_TOKENS_PER_ACCOUNT {
-        return Err(ApiError::bad_request(
-            "too many API tokens, delete one first",
-        ));
+        return Err(ApiError::bad_request("too many API tokens, delete one first"));
     }
     audit_user_action(
         this.db.as_ref(),

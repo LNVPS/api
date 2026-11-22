@@ -143,9 +143,7 @@ async fn replay_silent_vm_is_not_a_looking_glass_outage_conv_283() {
     assert!(ping.contains("\"status\": \"no_reply_from_vm\""));
     assert!(ping.contains("no reply from this VM"));
     assert!(!ping.contains("unavailable"));
-    println!(
-        "BEFORE ping_vm: Error: looking glass returned no traceroute output for 185.18.221.221 - the probe tool on the edge may be unavailable"
-    );
+    println!("BEFORE ping_vm: Error: looking glass returned no traceroute output for 185.18.221.221 - the probe tool on the edge may be unavailable");
     println!("AFTER ping_vm: {ping}");
 
     let trace = exec
