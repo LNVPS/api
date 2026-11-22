@@ -233,7 +233,6 @@ mod tests {
     use super::super::tests::{PayNode, handler, vm_with_payment};
     use super::*;
     use lnvps_api_common::{FakeGateway, MockDb};
-    use lnvps_db::LNVpsDbBase;
 
     async fn gateway_payment(db: &MockDb, payment: &SubscriptionPayment, method: PaymentMethod) {
         let mut payments = db.subscription_payments.lock().await;
@@ -263,7 +262,7 @@ mod tests {
             node.paid.lock().unwrap().is_empty(),
             "the node pays nothing"
         );
-        let calls = fake.refunds.lock().unwrap();
+        let calls = fake.refunds.lock().unwrap().clone();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "pgw:gw1");
         assert_eq!(calls[0].2.as_deref(), Some("bc1qdest"));

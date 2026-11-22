@@ -2,14 +2,13 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use config::{Config, File};
 use lnvps_api::gateway_import::{
-    FsCredentials, HttpGatewayAdmin, ImportOptions, import_providers, render_report,
+    CONFIRM_ENV, FsCredentials, HttpGatewayAdmin, ImportOptions, confirm_apply, import_providers,
+    render_report,
 };
 use lnvps_api::settings::Settings;
 use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbMysql};
 use std::path::PathBuf;
 use std::sync::Arc;
-
-const CONFIRM_ENV: &str = "GATEWAY_IMPORT_CONFIRM";
 
 #[derive(Parser)]
 #[clap(about = "Import payment_method_config rows as providers of the LNVPS gateway project")]
@@ -37,9 +36,7 @@ struct Args {
 async fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
-    if args.apply && std::env::var(CONFIRM_ENV).as_deref() != Ok("yes") {
-        anyhow::bail!("--apply refused: set {CONFIRM_ENV}=yes to confirm creating providers");
-    }
+    confirm_apply(args.apply, std::env::var(CONFIRM_ENV).ok().as_deref())?;
     let admin_token = args
         .admin_token
         .clone()

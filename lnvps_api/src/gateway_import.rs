@@ -6,6 +6,15 @@ use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::sync::Arc;
 
+pub const CONFIRM_ENV: &str = "GATEWAY_IMPORT_CONFIRM";
+
+pub fn confirm_apply(apply: bool, env: Option<&str>) -> Result<()> {
+    if apply && env != Some("yes") {
+        bail!("--apply refused: set {CONFIRM_ENV}=yes to confirm creating providers");
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct NewProvider {
     pub method: String,
@@ -445,6 +454,17 @@ mod tests {
             apply,
             company_id: None,
         }
+    }
+
+    #[test]
+    fn apply_needs_the_exact_confirmation() {
+        assert!(confirm_apply(false, None).is_ok());
+        assert!(confirm_apply(false, Some("no")).is_ok());
+        for bad in [None, Some("no"), Some(""), Some("YES"), Some("yes ")] {
+            let err = confirm_apply(true, bad).unwrap_err().to_string();
+            assert!(err.contains("GATEWAY_IMPORT_CONFIRM"), "{err}");
+        }
+        assert!(confirm_apply(true, Some("yes")).is_ok());
     }
 
     #[test]
