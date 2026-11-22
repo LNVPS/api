@@ -20,6 +20,7 @@ use lnvps_api_common::{
     CostResult, ExchangeRateService, NewPaymentInfo, PricingEngine, UpgradeConfig, VatClient,
     WorkCommander, round_msat_to_sat,
 };
+use lnvps_api_common::{GatewayInvoice, GatewayInvoiceRequest, PaymentGateway};
 use lnvps_db::{
     LNVpsDb, LineItemType, PaymentMethod, RenewalSource, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentType, User, UserPaymentMethod, VmAddonKind,
@@ -27,7 +28,7 @@ use lnvps_db::{
 use log::{debug, info, warn};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use payments_rs::fiat::FiatPaymentService;
-use payments_rs::lightning::{AddInvoiceRequest, LightningNode};
+use payments_rs::lightning::LightningNode;
 use payments_rs::onchain::{NewAddressRequest, OnChainProvider};
 use std::ops::Add;
 use std::str::FromStr;
@@ -281,6 +282,7 @@ pub struct SubscriptionHandler {
     tx: Arc<dyn WorkCommander>,
 
     node: Arc<dyn LightningNode>,
+    lightning_gateway: Arc<dyn PaymentGateway>,
     onchain: Arc<dyn OnChainProvider>,
     revolut: Option<Arc<dyn FiatPaymentService>>,
     swap: Option<Arc<dyn SwapProvider>>,
@@ -313,6 +315,9 @@ impl SubscriptionHandler {
         Ok(Self {
             revolut,
             swap: None,
+            lightning_gateway: Arc::new(crate::payments::gateway::InProcessGateway::new(
+                node.clone(),
+            )),
             pe: PricingEngine::new(db.clone(), rates, vat),
             vm_provisioner: VmProvisioner::new(settings, db.clone()),
             ip_range_provisioner: IpRangeProvisioner::new(db.clone(), tx.clone()),
@@ -506,6 +511,42 @@ impl SubscriptionHandler {
             label,
         )
         .await
+    }
+
+    pub fn lightning_gateway(&self) -> Arc<dyn PaymentGateway> {
+        self.lightning_gateway.clone()
+    }
+
+    pub fn with_lightning_gateway(mut self, gateway: Arc<dyn PaymentGateway>) -> Self {
+        self.lightning_gateway = gateway;
+        self
+    }
+
+    async fn new_lightning_invoice(
+        &self,
+        subscription_id: u64,
+        user_id: u64,
+        payment_type: SubscriptionPaymentType,
+        amount_msat: u64,
+        tax_msat: u64,
+        description: String,
+        expires_in_secs: u32,
+    ) -> Result<GatewayInvoice> {
+        let payment_id: [u8; 32] = rand::random();
+        self.lightning_gateway
+            .create_lightning_invoice(GatewayInvoiceRequest {
+                payment_id: payment_id.to_vec(),
+                amount_msat,
+                tax_msat,
+                description,
+                expires_in_secs,
+                customer_ref: user_id.to_string(),
+                metadata: serde_json::json!({
+                    "subscription_id": subscription_id,
+                    "payment_type": format!("{payment_type:?}"),
+                }),
+            })
+            .await
     }
 
     #[cfg(test)]
@@ -1518,17 +1559,20 @@ impl SubscriptionHandler {
                 );
 
                 let invoice = self
-                    .node
-                    .add_invoice(AddInvoiceRequest {
-                        memo: Some(desc),
-                        amount: invoice_amount,
-                        expire: Some(INVOICE_EXPIRE as u32),
-                    })
+                    .new_lightning_invoice(
+                        subscription_id,
+                        subscription.user_id,
+                        payment_type,
+                        invoice_amount,
+                        tax,
+                        desc,
+                        INVOICE_EXPIRE as u32,
+                    )
                     .await?;
 
                 SubscriptionPayment {
                     renewal_source: Some(source),
-                    id: hex::decode(invoice.payment_hash())?,
+                    id: invoice.payment_id,
                     subscription_id,
                     user_id: subscription.user_id,
                     created: Utc::now(),
@@ -1537,7 +1581,7 @@ impl SubscriptionHandler {
                     currency: converted_currency.to_string(),
                     payment_method: method,
                     payment_type,
-                    external_data: invoice.pr().into(),
+                    external_data: invoice.bolt11.into(),
                     external_id: invoice.external_id,
                     is_paid: false,
                     rate,
@@ -2276,18 +2320,21 @@ impl SubscriptionHandler {
                     credit_covered / 1000
                 );
                 let invoice = self
-                    .node
-                    .add_invoice(AddInvoiceRequest {
-                        memo: Some(desc),
-                        amount: total_amount,
-                        expire: Some(INVOICE_EXPIRE as u32),
-                    })
+                    .new_lightning_invoice(
+                        subscription_id,
+                        user_id,
+                        payment_type,
+                        total_amount,
+                        p.tax,
+                        desc,
+                        INVOICE_EXPIRE as u32,
+                    )
                     .await?;
                 SubscriptionPayment {
                     // Every caller here is a customer action (renew, upgrade, purchase);
                     // worker-initiated renewals go through renew_subscription_inner.
                     renewal_source: Some(RenewalSource::Manual),
-                    id: hex::decode(invoice.payment_hash())?,
+                    id: invoice.payment_id,
                     subscription_id,
                     user_id,
                     created: Utc::now(),
@@ -2296,7 +2343,7 @@ impl SubscriptionHandler {
                     currency: p.currency.to_string(),
                     payment_method: method,
                     payment_type,
-                    external_data: invoice.pr().into(),
+                    external_data: invoice.bolt11.into(),
                     external_id: invoice.external_id,
                     is_paid: false,
                     rate: p.rate.rate,

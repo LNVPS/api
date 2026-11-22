@@ -28,6 +28,17 @@ read-only: false
 max-prepay-days: 365
 ```
 
+Optional `gateway` section (staged migration to the payment gateway, see
+[payment-gateway-migration.md](payment-gateway-migration.md)):
+
+```yaml
+gateway:
+  url: "https://pay.example.com"
+  api-key: "..."
+  webhook-secret: "..."
+  methods: ["lightning"]
+```
+
 > **Payment providers** (Lightning node, on-chain wallet, Revolut) are **not**
 > configured here — they live in the `payment_method_config` DB table and are
 > managed via `POST`/`PATCH /api/admin/v1/payment_method_configs`.

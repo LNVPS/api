@@ -310,6 +310,13 @@ async fn main() -> Result<(), Error> {
         work_commander.clone(),
         status.clone(),
     )?;
+    let sub_handler = match settings.gateway.as_ref().filter(|g| g.handles("lightning")) {
+        Some(g) => {
+            info!("Lightning invoices are created through the payment gateway");
+            sub_handler.with_lightning_gateway(Arc::new(lnvps_api_common::GatewayClient::new(g)))
+        }
+        None => sub_handler,
+    };
     sub_handler.vm_provisioner().init().await?;
 
     // On-chain provider for the worker's automated on-chain referral payouts.

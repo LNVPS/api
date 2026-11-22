@@ -114,6 +114,9 @@ pub struct Settings {
 
     #[serde(default)]
     pub app_backups: Option<lnvps_api_common::object_store::ObjectStoreConfig>,
+
+    #[serde(default)]
+    pub gateway: Option<lnvps_api_common::GatewayConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -785,6 +788,7 @@ pub fn mock_settings() -> Settings {
         webauthn: None,
         session: None,
         app_backups: None,
+        gateway: None,
     }
 }
 

@@ -15,7 +15,8 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
-mod invoice;
+pub mod gateway;
+pub(crate) mod invoice;
 mod onchain;
 #[cfg(feature = "revolut")]
 mod revolut;

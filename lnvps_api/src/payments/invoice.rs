@@ -113,7 +113,7 @@ impl NodeInvoiceHandler {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::mocks::{MockNode, MockOnChainProvider};
     use crate::provisioner::VmProvisioner;
@@ -129,7 +129,7 @@ mod tests {
     use std::sync::Arc;
 
     /// Build a DB with a VM, subscription, line item and unpaid payment.
-    async fn setup_renewal(
+    pub(crate) async fn setup_renewal(
         time_value: u64,
         payment_type: SubscriptionPaymentType,
     ) -> Result<(

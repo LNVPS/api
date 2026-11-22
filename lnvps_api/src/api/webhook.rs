@@ -1,8 +1,14 @@
+use crate::payments::gateway::handle_gateway_event;
 use axum::Router;
+use axum::body::Bytes;
 use axum::extract::Request;
+use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
-use axum::routing::any;
+use axum::routing::{any, post};
 use futures::StreamExt;
+use lnvps_api_common::{GATEWAY_WEBHOOK_PATH, parse_gateway_event};
+use log::{error, warn};
 use payments_rs::webhook::{WEBHOOK_BRIDGE, WebhookMessage};
 use std::collections::HashMap;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -19,7 +25,7 @@ use crate::api::RouterState;
 const MAX_WEBHOOK_BODY: usize = 256 * 1024;
 
 pub fn router() -> Router<RouterState> {
-    let mut router = Router::new();
+    let mut router = Router::new().route(GATEWAY_WEBHOOK_PATH, post(gateway_webhook));
 
     #[cfg(feature = "revolut")]
     {
@@ -54,6 +60,33 @@ fn collect_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String> {
             )
         })
         .collect()
+}
+
+async fn gateway_webhook(
+    State(state): State<RouterState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    let Some(config) = state.settings.gateway.as_ref() else {
+        return StatusCode::NOT_FOUND;
+    };
+    let signature = headers
+        .get(payment_gateway_client::SIGNATURE_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let event = match parse_gateway_event(&body, signature, config) {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("{}", e);
+            return StatusCode::UNAUTHORIZED;
+        }
+    };
+    match handle_gateway_event(&state.db, &state.sub_handler, &event).await {
+        Ok(_) => StatusCode::OK,
+        Err(e) => {
+            error!("gateway event {} failed: {}", event.event_id, e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
 }
 
 async fn send_webhook(req: Request) -> StatusCode {
