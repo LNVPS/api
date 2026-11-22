@@ -5,7 +5,8 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use k8s_openapi::api::core::v1::ConfigMap;
-use kube::api::{Api, Patch, PatchParams};
+use kube::api::{Api, ApiResource, DeleteParams, DynamicObject, ListParams, Patch, PatchParams};
+use kube::core::GroupVersionKind;
 use kube::{Client, ResourceExt};
 use lnvps_api_common::k8s_names::{deployment_id_from_namespace, deployment_namespace};
 use lnvps_compose::L4Protocol;
@@ -23,6 +24,7 @@ pub const DEFAULT_UDP_CONFIGMAP: &str = "udp-services";
 pub enum ForwarderKind {
     #[default]
     IngressNginx,
+    Traefik,
     Nodeport,
     Loadbalancer,
 }
@@ -31,6 +33,7 @@ impl fmt::Display for ForwarderKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             ForwarderKind::IngressNginx => "ingress-nginx",
+            ForwarderKind::Traefik => "traefik",
             ForwarderKind::Nodeport => "nodeport",
             ForwarderKind::Loadbalancer => "loadbalancer",
         })
@@ -86,6 +89,32 @@ impl Default for IngressNginxConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TraefikConfig {
+    #[serde(default = "default_tcp_entrypoint_prefix")]
+    pub tcp_entrypoint_prefix: String,
+    #[serde(default = "default_udp_entrypoint_prefix")]
+    pub udp_entrypoint_prefix: String,
+}
+
+fn default_tcp_entrypoint_prefix() -> String {
+    "g".to_string()
+}
+
+fn default_udp_entrypoint_prefix() -> String {
+    "gu".to_string()
+}
+
+impl Default for TraefikConfig {
+    fn default() -> Self {
+        Self {
+            tcp_entrypoint_prefix: default_tcp_entrypoint_prefix(),
+            udp_entrypoint_prefix: default_udp_entrypoint_prefix(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct L4Config {
@@ -95,6 +124,8 @@ pub struct L4Config {
     pub port_range: PortRange,
     #[serde(default)]
     pub ingress_nginx: IngressNginxConfig,
+    #[serde(default)]
+    pub traefik: TraefikConfig,
 }
 
 impl L4Config {
@@ -113,8 +144,10 @@ impl L4Config {
 
 pub fn ensure_supported(kind: ForwarderKind) -> Result<()> {
     match kind {
-        ForwarderKind::IngressNginx => Ok(()),
-        other => bail!("l4 forwarder '{other}' is not supported yet; use 'ingress-nginx'"),
+        ForwarderKind::IngressNginx | ForwarderKind::Traefik => Ok(()),
+        other => {
+            bail!("l4 forwarder '{other}' is not supported yet; use 'ingress-nginx' or 'traefik'")
+        }
     }
 }
 
@@ -314,15 +347,248 @@ impl L4Forwarder for IngressNginxForwarder {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteObject {
+    pub namespace: String,
+    pub name: String,
+    pub entry_points: Vec<String>,
+    pub spec: serde_json::Value,
+}
+
+#[async_trait]
+pub trait RouteStore: Send + Sync {
+    async fn list(&self, protocol: L4Protocol) -> Result<Vec<RouteObject>>;
+    async fn apply(
+        &self,
+        protocol: L4Protocol,
+        namespace: &str,
+        name: &str,
+        spec: &serde_json::Value,
+    ) -> Result<()>;
+    async fn delete(&self, protocol: L4Protocol, namespace: &str, name: &str) -> Result<()>;
+}
+
+fn route_resource(protocol: L4Protocol) -> ApiResource {
+    let (kind, plural) = match protocol {
+        L4Protocol::Tcp => ("IngressRouteTCP", "ingressroutetcps"),
+        L4Protocol::Udp => ("IngressRouteUDP", "ingressrouteudps"),
+    };
+    ApiResource::from_gvk_with_plural(
+        &GroupVersionKind::gvk("traefik.io", "v1alpha1", kind),
+        plural,
+    )
+}
+
+pub struct KubeRoutes(pub Client);
+
+#[async_trait]
+impl RouteStore for KubeRoutes {
+    async fn list(&self, protocol: L4Protocol) -> Result<Vec<RouteObject>> {
+        let api: Api<DynamicObject> = Api::all_with(self.0.clone(), &route_resource(protocol));
+        let list = api.list(&ListParams::default()).await?;
+        Ok(list
+            .items
+            .into_iter()
+            .map(|o| {
+                let spec = o.data.get("spec").cloned().unwrap_or_default();
+                let entry_points = spec
+                    .get("entryPoints")
+                    .and_then(|e| e.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                RouteObject {
+                    namespace: o.namespace().unwrap_or_default(),
+                    name: o.name_any(),
+                    entry_points,
+                    spec,
+                }
+            })
+            .collect())
+    }
+
+    async fn apply(
+        &self,
+        protocol: L4Protocol,
+        namespace: &str,
+        name: &str,
+        spec: &serde_json::Value,
+    ) -> Result<()> {
+        let ar = route_resource(protocol);
+        let api: Api<DynamicObject> = Api::namespaced_with(self.0.clone(), namespace, &ar);
+        let body = serde_json::json!({
+            "apiVersion": ar.api_version,
+            "kind": ar.kind,
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "labels": { "app.kubernetes.io/managed-by": "lnvps-operator" },
+            },
+            "spec": spec,
+        });
+        api.patch(
+            name,
+            &PatchParams::apply("lnvps-operator").force(),
+            &Patch::Apply(&body),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn delete(&self, protocol: L4Protocol, namespace: &str, name: &str) -> Result<()> {
+        let api: Api<DynamicObject> =
+            Api::namespaced_with(self.0.clone(), namespace, &route_resource(protocol));
+        match api.delete(name, &DeleteParams::default()).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
+
+pub struct TraefikForwarder {
+    config: TraefikConfig,
+    routes: Arc<dyn RouteStore>,
+}
+
+impl TraefikForwarder {
+    fn prefix(&self, protocol: L4Protocol) -> &str {
+        match protocol {
+            L4Protocol::Tcp => &self.config.tcp_entrypoint_prefix,
+            L4Protocol::Udp => &self.config.udp_entrypoint_prefix,
+        }
+    }
+
+    fn entry_point(&self, protocol: L4Protocol, port: u16) -> String {
+        format!("{}{port}", self.prefix(protocol))
+    }
+
+    fn port_of(&self, protocol: L4Protocol, entry_point: &str) -> Option<u16> {
+        entry_point
+            .strip_prefix(self.prefix(protocol))?
+            .parse()
+            .ok()
+    }
+
+    fn spec(&self, entry: &L4Entry) -> serde_json::Value {
+        let service = serde_json::json!({
+            "name": entry.target.service,
+            "port": entry.target.container_port,
+        });
+        let route = match entry.target.protocol {
+            L4Protocol::Tcp => serde_json::json!({
+                "match": "HostSNI(`*`)",
+                "services": [service],
+            }),
+            L4Protocol::Udp => serde_json::json!({ "services": [service] }),
+        };
+        serde_json::json!({
+            "entryPoints": [self.entry_point(entry.target.protocol, entry.public_port)],
+            "routes": [route],
+        })
+    }
+}
+
+pub fn route_name(port: u16) -> String {
+    format!("l4-{port}")
+}
+
+fn is_owned_namespace(namespace: &str) -> bool {
+    deployment_id_from_namespace(namespace).is_some()
+}
+
+#[async_trait]
+impl L4Forwarder for TraefikForwarder {
+    fn kind(&self) -> ForwarderKind {
+        ForwarderKind::Traefik
+    }
+
+    async fn foreign_ports(&self) -> Result<BTreeSet<u16>> {
+        let mut ports = BTreeSet::new();
+        for protocol in [L4Protocol::Tcp, L4Protocol::Udp] {
+            for route in self.routes.list(protocol).await? {
+                if is_owned_namespace(&route.namespace) {
+                    continue;
+                }
+                ports.extend(
+                    route
+                        .entry_points
+                        .iter()
+                        .filter_map(|e| self.port_of(protocol, e)),
+                );
+            }
+        }
+        Ok(ports)
+    }
+
+    async fn sync(&self, entries: &[L4Entry]) -> Result<()> {
+        for protocol in [L4Protocol::Tcp, L4Protocol::Udp] {
+            let current = self.routes.list(protocol).await?;
+            let wanted: Vec<&L4Entry> = entries
+                .iter()
+                .filter(|e| e.target.protocol == protocol)
+                .collect();
+            for entry in &wanted {
+                let entry_point = self.entry_point(protocol, entry.public_port);
+                if let Some(other) = current.iter().find(|r| {
+                    !is_owned_namespace(&r.namespace) && r.entry_points.contains(&entry_point)
+                }) {
+                    bail!(
+                        "public port {} is already routed by {}/{}",
+                        entry.public_port,
+                        other.namespace,
+                        other.name
+                    );
+                }
+            }
+            let mut keep = BTreeSet::new();
+            for entry in wanted {
+                let namespace = deployment_namespace(entry.deployment_id);
+                let name = route_name(entry.public_port);
+                let spec = self.spec(entry);
+                keep.insert((namespace.clone(), name.clone()));
+                let unchanged = current
+                    .iter()
+                    .any(|r| r.namespace == namespace && r.name == name && r.spec == spec);
+                if !unchanged {
+                    self.routes
+                        .apply(protocol, &namespace, &name, &spec)
+                        .await?;
+                }
+            }
+            for route in current {
+                if is_owned_namespace(&route.namespace)
+                    && !keep.contains(&(route.namespace.clone(), route.name.clone()))
+                {
+                    self.routes
+                        .delete(protocol, &route.namespace, &route.name)
+                        .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 pub fn build_forwarder(
     config: &L4Config,
     store: Arc<dyn ConfigMapStore>,
+    routes: Arc<dyn RouteStore>,
 ) -> Result<Arc<dyn L4Forwarder>> {
     ensure_supported(config.forwarder)?;
-    Ok(Arc::new(IngressNginxForwarder {
-        config: config.ingress_nginx.clone(),
-        store,
-    }))
+    Ok(match config.forwarder {
+        ForwarderKind::Traefik => Arc::new(TraefikForwarder {
+            config: config.traefik.clone(),
+            routes,
+        }),
+        _ => Arc::new(IngressNginxForwarder {
+            config: config.ingress_nginx.clone(),
+            store,
+        }),
+    })
 }
 
 pub struct L4Runtime {
@@ -331,10 +597,14 @@ pub struct L4Runtime {
 }
 
 impl L4Runtime {
-    pub fn new(config: &L4Config, store: Arc<dyn ConfigMapStore>) -> Result<Self> {
+    pub fn new(
+        config: &L4Config,
+        store: Arc<dyn ConfigMapStore>,
+        routes: Arc<dyn RouteStore>,
+    ) -> Result<Self> {
         config.validate()?;
         Ok(Self {
-            forwarder: build_forwarder(config, store)?,
+            forwarder: build_forwarder(config, store, routes)?,
             port_range: config.port_range.clone(),
         })
     }
@@ -478,8 +748,150 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeRoutes {
+        objects: Mutex<Vec<(L4Protocol, RouteObject)>>,
+        writes: Mutex<usize>,
+    }
+
+    impl FakeRoutes {
+        fn add(&self, protocol: L4Protocol, ns: &str, name: &str, entry_point: &str) {
+            self.objects.lock().unwrap().push((
+                protocol,
+                RouteObject {
+                    namespace: ns.into(),
+                    name: name.into(),
+                    entry_points: vec![entry_point.into()],
+                    spec: serde_json::json!({ "entryPoints": [entry_point] }),
+                },
+            ));
+        }
+
+        fn names(&self, protocol: L4Protocol) -> Vec<String> {
+            self.objects
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(p, _)| *p == protocol)
+                .map(|(_, o)| format!("{}/{}", o.namespace, o.name))
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl RouteStore for FakeRoutes {
+        async fn list(&self, protocol: L4Protocol) -> Result<Vec<RouteObject>> {
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(p, _)| *p == protocol)
+                .map(|(_, o)| o.clone())
+                .collect())
+        }
+
+        async fn apply(
+            &self,
+            protocol: L4Protocol,
+            namespace: &str,
+            name: &str,
+            spec: &serde_json::Value,
+        ) -> Result<()> {
+            *self.writes.lock().unwrap() += 1;
+            let mut objects = self.objects.lock().unwrap();
+            objects
+                .retain(|(p, o)| !(*p == protocol && o.namespace == namespace && o.name == name));
+            let entry_points = spec["entryPoints"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            objects.push((
+                protocol,
+                RouteObject {
+                    namespace: namespace.into(),
+                    name: name.into(),
+                    entry_points,
+                    spec: spec.clone(),
+                },
+            ));
+            Ok(())
+        }
+
+        async fn delete(&self, protocol: L4Protocol, namespace: &str, name: &str) -> Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .retain(|(p, o)| !(*p == protocol && o.namespace == namespace && o.name == name));
+            Ok(())
+        }
+    }
+
     fn forwarder(store: Arc<FakeStore>) -> Arc<dyn L4Forwarder> {
-        build_forwarder(&L4Config::default(), store).unwrap()
+        build_forwarder(&L4Config::default(), store, Arc::new(FakeRoutes::default())).unwrap()
+    }
+
+    fn traefik(routes: Arc<FakeRoutes>) -> Arc<dyn L4Forwarder> {
+        let config = L4Config {
+            forwarder: ForwarderKind::Traefik,
+            ..Default::default()
+        };
+        build_forwarder(&config, Arc::new(FakeStore::default()), routes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn traefik_creates_an_ingress_route_per_deployment() {
+        let routes = Arc::new(FakeRoutes::default());
+        let f = traefik(routes.clone());
+        assert_eq!(f.kind(), ForwarderKind::Traefik);
+        f.sync(&[
+            entry(25565, 7, L4Protocol::Tcp),
+            entry(25566, 8, L4Protocol::Udp),
+        ])
+        .await
+        .unwrap();
+        assert_eq!(routes.names(L4Protocol::Tcp), vec!["app-7/l4-25565"]);
+        assert_eq!(routes.names(L4Protocol::Udp), vec!["app-8/l4-25566"]);
+        let objects = routes.objects.lock().unwrap();
+        assert_eq!(
+            objects[0].1.spec,
+            serde_json::json!({
+                "entryPoints": ["g25565"],
+                "routes": [{"match": "HostSNI(`*`)", "services": [{"name": "mc", "port": 25565}]}],
+            })
+        );
+        assert_eq!(objects[1].1.entry_points, vec!["gu25566"]);
+    }
+
+    #[tokio::test]
+    async fn traefik_sync_is_idempotent_prunes_owned_and_keeps_foreign() {
+        let routes = Arc::new(FakeRoutes::default());
+        routes.add(L4Protocol::Tcp, "git", "gitea-ssh", "ssh");
+        routes.add(L4Protocol::Tcp, "app-9", "l4-25570", "g25570");
+        let f = traefik(routes.clone());
+        f.sync(&[entry(25565, 7, L4Protocol::Tcp)]).await.unwrap();
+        assert_eq!(*routes.writes.lock().unwrap(), 1);
+        f.sync(&[entry(25565, 7, L4Protocol::Tcp)]).await.unwrap();
+        assert_eq!(*routes.writes.lock().unwrap(), 1);
+        let mut names = routes.names(L4Protocol::Tcp);
+        names.sort();
+        assert_eq!(names, vec!["app-7/l4-25565", "git/gitea-ssh"]);
+    }
+
+    #[tokio::test]
+    async fn traefik_foreign_ports_and_collisions() {
+        let routes = Arc::new(FakeRoutes::default());
+        routes.add(L4Protocol::Tcp, "git", "other", "g25567");
+        routes.add(L4Protocol::Tcp, "app-3", "l4-25565", "g25565");
+        let f = traefik(routes.clone());
+        assert_eq!(f.foreign_ports().await.unwrap(), BTreeSet::from([25567]));
+        let err = f
+            .sync(&[entry(25567, 1, L4Protocol::Tcp)])
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("git/other"));
     }
 
     #[test]
@@ -593,7 +1005,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let f = build_forwarder(&config, store.clone()).unwrap();
+        let f = build_forwarder(&config, store.clone(), Arc::new(FakeRoutes::default())).unwrap();
         f.sync(&[entry(25565, 1, L4Protocol::Tcp)]).await.unwrap();
         assert_eq!(store.data("edge", "my-tcp")["25565"], "app-1/mc:25565");
     }
@@ -655,10 +1067,14 @@ mod tests {
                 ..Default::default()
             };
             let store = FakeStore::with("ingress-nginx", "tcp-services", &[]);
-            let err = build_forwarder(&config, store.clone()).err().unwrap();
+            let err = build_forwarder(&config, store.clone(), Arc::new(FakeRoutes::default()))
+                .err()
+                .unwrap();
             assert_eq!(
                 err.to_string(),
-                format!("l4 forwarder '{kind}' is not supported yet; use 'ingress-nginx'")
+                format!(
+                    "l4 forwarder '{kind}' is not supported yet; use 'ingress-nginx' or 'traefik'"
+                )
             );
             assert!(config.validate().is_err());
             assert!(store.patches.lock().unwrap().is_empty());
@@ -730,7 +1146,7 @@ mod tests {
             port_range: range,
             ..Default::default()
         };
-        L4Runtime::new(&config, store).unwrap()
+        L4Runtime::new(&config, store, Arc::new(FakeRoutes::default())).unwrap()
     }
 
     #[tokio::test]

@@ -349,7 +349,11 @@ async fn main() -> Result<()> {
         }
     };
 
-    let l4 = l4::L4Runtime::new(&settings.l4, Arc::new(l4::KubeConfigMaps(client.clone())))?;
+    let l4 = l4::L4Runtime::new(
+        &settings.l4,
+        Arc::new(l4::KubeConfigMaps(client.clone())),
+        Arc::new(l4::KubeRoutes(client.clone())),
+    )?;
 
     let context = Arc::new(Context {
         client: client.clone(),
