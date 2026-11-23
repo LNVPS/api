@@ -9,6 +9,7 @@ pub struct OnChainAddress {
 }
 
 pub(super) struct CryptoContext {
+    pub(super) company_id: u64,
     payment_id: Vec<u8>,
     user_id: u64,
     tax_msat: u64,
@@ -17,6 +18,7 @@ pub(super) struct CryptoContext {
 
 impl CryptoContext {
     pub(super) fn payment(
+        company_id: u64,
         payment_id: [u8; 32],
         user_id: u64,
         subscription_id: u64,
@@ -24,6 +26,7 @@ impl CryptoContext {
         tax_msat: u64,
     ) -> Self {
         Self {
+            company_id,
             payment_id: payment_id.to_vec(),
             user_id,
             tax_msat,
@@ -34,8 +37,9 @@ impl CryptoContext {
         }
     }
 
-    pub(super) fn topup(user_id: u64, reference: [u8; 32]) -> Self {
+    pub(super) fn topup(company_id: u64, user_id: u64, reference: [u8; 32]) -> Self {
         Self {
+            company_id,
             payment_id: reference.to_vec(),
             user_id,
             tax_msat: 0,

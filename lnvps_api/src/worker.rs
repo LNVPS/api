@@ -376,7 +376,7 @@ impl Worker {
             node,
             subscription_handler.pricing_engine(),
         )
-        .with_gateway(subscription_handler.refund_gateway());
+        .with_gateway_directory(subscription_handler.gateways().clone());
 
         let feedback: Arc<dyn WorkFeedback> = if let Some(c) = &settings.redis {
             Arc::new(RedisWorkFeedback::new(&c.url).await?)

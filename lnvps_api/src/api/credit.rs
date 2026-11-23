@@ -227,9 +227,19 @@ async fn v1_topup_credit(
     match method {
         "lightning" => {
             expire = LIGHTNING_TOPUP_EXPIRE;
+            let company_id = this
+                .db
+                .list_payment_method_configs()
+                .await?
+                .iter()
+                .find(|c| c.enabled && c.payment_method == PaymentMethod::Lightning)
+                .map(|c| c.company_id)
+                .unwrap_or(1);
             let invoice = this
                 .sub_handler
-                .lightning_gateway()
+                .lightning_gateway_for(company_id)
+                .await
+                .map_err(ApiError::internal)?
                 .create_lightning_invoice(GatewayInvoiceRequest {
                     payment_id: rand::random::<[u8; 32]>().to_vec(),
                     amount_msat: amount,
@@ -309,9 +319,18 @@ pub(crate) async fn new_lightning_topup(
 ) -> anyhow::Result<String> {
     anyhow::ensure!(amount_msat > 0, "Top-up amount must be positive");
     let amount = round_msat_to_sat(amount_msat);
+    let company_id = this
+        .db
+        .list_payment_method_configs()
+        .await?
+        .iter()
+        .find(|c| c.enabled && c.payment_method == PaymentMethod::Lightning)
+        .map(|c| c.company_id)
+        .unwrap_or(1);
     let invoice = this
         .sub_handler
-        .lightning_gateway()
+        .lightning_gateway_for(company_id)
+        .await?
         .create_lightning_invoice(GatewayInvoiceRequest {
             payment_id: rand::random::<[u8; 32]>().to_vec(),
             amount_msat: amount,

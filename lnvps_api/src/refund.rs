@@ -162,6 +162,7 @@ pub struct VmRefundHandler {
     pricing: PricingEngine,
     history: VmHistoryLogger,
     gateway: Option<Arc<dyn PaymentGateway>>,
+    directory: Option<lnvps_api_common::GatewayDirectory>,
 }
 
 impl VmRefundHandler {
@@ -173,6 +174,7 @@ impl VmRefundHandler {
             pricing,
             history,
             gateway: None,
+            directory: None,
         }
     }
 

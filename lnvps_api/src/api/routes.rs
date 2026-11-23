@@ -794,8 +794,10 @@ async fn v1_delete_payment_method(
         return ApiData::err("Payment method not found");
     }
     if let Some(gateway_id) = method.gateway_method_id {
-        let Some(gateway) = this.sub_handler.card_gateway() else {
-            return ApiData::err("Payment gateway is not configured");
+        let gateway = match this.sub_handler.card_gateway().await {
+            Ok(Some(g)) => g,
+            Ok(None) => return ApiData::err("Payment gateway is not configured"),
+            Err(e) => return Err(ApiError::internal(e)),
         };
         gateway
             .delete_saved_method(gateway_id)

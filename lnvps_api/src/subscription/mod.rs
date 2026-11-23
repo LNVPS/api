@@ -300,12 +300,8 @@ pub struct SubscriptionHandler {
     tx: Arc<dyn WorkCommander>,
 
     node: Arc<dyn LightningNode>,
-    lightning_gateway: Arc<dyn PaymentGateway>,
-    card_gateway: Option<Arc<dyn PaymentGateway>>,
-    off_session: OffSessionRenewals,
+    gateways: lnvps_api_common::GatewayDirectory,
     onchain: Arc<dyn OnChainProvider>,
-    onchain_gateway: Option<Arc<dyn PaymentGateway>>,
-    swap_gateway: Option<Arc<dyn PaymentGateway>>,
     revolut: Option<Arc<dyn FiatPaymentService>>,
     swap: Option<Arc<dyn SwapProvider>>,
 
@@ -337,13 +333,12 @@ impl SubscriptionHandler {
         Ok(Self {
             revolut,
             swap: None,
-            onchain_gateway: None,
-            swap_gateway: None,
-            card_gateway: None,
-            off_session: OffSessionRenewals::Off,
-            lightning_gateway: Arc::new(crate::payments::gateway::InProcessGateway::new(
-                node.clone(),
-            )),
+            gateways: lnvps_api_common::GatewayDirectory::new(
+                db.clone(),
+                Arc::new(crate::payments::gateway::InProcessGateway::new(
+                    node.clone(),
+                )),
+            ),
             pe: PricingEngine::new(db.clone(), rates, vat),
             vm_provisioner: VmProvisioner::new(settings, db.clone()),
             ip_range_provisioner: IpRangeProvisioner::new(db.clone(), tx.clone()),
@@ -393,7 +388,11 @@ impl SubscriptionHandler {
         label: String,
         ctx: &CryptoContext,
     ) -> Result<OnChainAddress> {
-        if let Some(gateway) = &self.onchain_gateway {
+        if let Some(gateway) = self
+            .gateways
+            .gateway_for(ctx.company_id, PaymentMethod::OnChain)
+            .await?
+        {
             let created = gateway
                 .create_onchain_address(ctx.request(amount_msat, memo, ONCHAIN_EXPIRE_SECS, None))
                 .await?;
@@ -445,7 +444,11 @@ impl SubscriptionHandler {
             "{} is not accepted for FixedFloat payments",
             coin
         );
-        if let Some(gateway) = &self.swap_gateway {
+        if let Some(gateway) = self
+            .gateways
+            .gateway_for(company_id, PaymentMethod::FixedFloat)
+            .await?
+        {
             let created = gateway
                 .create_swap(ctx.request(
                     amount_msat,
@@ -533,18 +536,19 @@ impl SubscriptionHandler {
         reference: [u8; 32],
         amount_msat: u64,
     ) -> Result<OnChainAddress> {
-        let enabled = self
+        let company_id = self
             .db
             .list_payment_method_configs()
             .await?
             .iter()
-            .any(|c| c.enabled && c.payment_method == PaymentMethod::OnChain);
-        ensure!(enabled, "On-chain payments are not enabled");
+            .find(|c| c.enabled && c.payment_method == PaymentMethod::OnChain)
+            .map(|c| c.company_id)
+            .context("On-chain payments are not enabled")?;
         self.new_onchain_address(
             amount_msat,
             "LNVPS credit top-up".to_string(),
             hex::encode(reference),
-            &CryptoContext::topup(user_id, reference),
+            &CryptoContext::topup(company_id, user_id, reference),
         )
         .await
     }
@@ -575,54 +579,92 @@ impl SubscriptionHandler {
             amount_msat,
             "LNVPS credit top-up".to_string(),
             hex::encode(reference),
-            &CryptoContext::topup(user_id, reference),
+            &CryptoContext::topup(company_id, user_id, reference),
         )
         .await
     }
 
-    pub fn lightning_gateway(&self) -> Arc<dyn PaymentGateway> {
-        self.lightning_gateway.clone()
+    pub fn gateways(&self) -> &lnvps_api_common::GatewayDirectory {
+        &self.gateways
     }
 
-    pub fn card_gateway(&self) -> Option<Arc<dyn PaymentGateway>> {
-        self.card_gateway.clone()
+    pub async fn lightning_gateway(&self) -> Result<Arc<dyn PaymentGateway>> {
+        self.gateways.lightning_any_company().await
+    }
+
+    pub async fn lightning_gateway_for(&self, company_id: u64) -> Result<Arc<dyn PaymentGateway>> {
+        self.gateways.lightning_for(company_id).await
+    }
+
+    pub async fn card_gateway(&self) -> Result<Option<Arc<dyn PaymentGateway>>> {
+        self.gateways.any_gateway().await
+    }
+
+    pub async fn card_gateway_for(
+        &self,
+        company_id: u64,
+        method: PaymentMethod,
+    ) -> Result<Option<Arc<dyn PaymentGateway>>> {
+        self.gateways.gateway_for(company_id, method).await
     }
 
     pub fn with_card_gateway(mut self, gateway: Arc<dyn PaymentGateway>) -> Self {
-        self.card_gateway = Some(gateway);
+        self.gateways = self.gateways.with_card(gateway);
         self
     }
 
     pub fn with_off_session_renewals(mut self, mode: OffSessionRenewals) -> Self {
-        self.off_session = mode;
+        self.gateways = self.gateways.with_off_session(mode);
         self
     }
 
     pub fn with_lightning_gateway(mut self, gateway: Arc<dyn PaymentGateway>) -> Self {
-        self.lightning_gateway = gateway;
+        self.gateways = self.gateways.with_lightning(gateway);
         self
     }
 
     pub fn with_onchain_gateway(mut self, gateway: Arc<dyn PaymentGateway>) -> Self {
-        self.onchain_gateway = Some(gateway);
+        self.gateways = self.gateways.with_onchain(gateway);
         self
     }
 
     pub fn with_swap_gateway(mut self, gateway: Arc<dyn PaymentGateway>) -> Self {
-        self.swap_gateway = Some(gateway);
+        self.gateways = self.gateways.with_swap(gateway);
         self
     }
 
-    pub fn refund_gateway(&self) -> Option<Arc<dyn PaymentGateway>> {
-        self.card_gateway
-            .clone()
-            .or_else(|| self.onchain_gateway.clone())
-            .or_else(|| self.swap_gateway.clone())
+    pub fn with_gateway_factory(mut self, factory: lnvps_api_common::GatewayFactory) -> Self {
+        self.gateways = self.gateways.with_factory(factory);
+        self
     }
 
-    async fn new_lightning_invoice(&self, spec: LightningInvoiceSpec) -> Result<GatewayInvoice> {
+    pub async fn payment_gateway_for(
+        &self,
+        payment: &SubscriptionPayment,
+    ) -> Result<Option<Arc<dyn PaymentGateway>>> {
+        let company_id = self
+            .db
+            .get_subscription(payment.subscription_id)
+            .await
+            .map(|s| s.company_id);
+        match company_id {
+            Ok(c) => self.gateways.in_flight(c).await,
+            Err(_) => Ok(self
+                .gateways
+                .for_method_any_company(payment.payment_method)
+                .await?),
+        }
+    }
+
+    async fn new_lightning_invoice(
+        &self,
+        company_id: u64,
+        spec: LightningInvoiceSpec,
+    ) -> Result<GatewayInvoice> {
         let payment_id: [u8; 32] = rand::random();
-        self.lightning_gateway
+        self.gateways
+            .lightning_for(company_id)
+            .await?
             .create_lightning_invoice(GatewayInvoiceRequest {
                 payment_id: payment_id.to_vec(),
                 amount_msat: spec.amount_msat,
@@ -1610,9 +1652,12 @@ impl SubscriptionHandler {
             });
         }
         let credit_covered = credit_amount(credit);
-        if self.wants_gateway_saved(method, mode)
+        if self
+            .wants_gateway_saved(subscription.company_id, method, mode)
+            .await
             && let Some(saved) = self
                 .gateway_saved_method(
+                    subscription.company_id,
                     user.id,
                     method,
                     match mode {
@@ -1633,6 +1678,8 @@ impl SubscriptionHandler {
             );
             let charge = self
                 .charge_gateway_saved_method(
+                    subscription.company_id,
+                    method,
                     &saved,
                     subscription_id,
                     subscription.user_id,
@@ -1714,15 +1761,18 @@ impl SubscriptionHandler {
                 );
 
                 let invoice = self
-                    .new_lightning_invoice(LightningInvoiceSpec {
-                        subscription_id,
-                        user_id: subscription.user_id,
-                        payment_type,
-                        amount_msat: invoice_amount,
-                        tax_msat: tax,
-                        description: desc,
-                        expires_in_secs: INVOICE_EXPIRE as u32,
-                    })
+                    .new_lightning_invoice(
+                        subscription.company_id,
+                        LightningInvoiceSpec {
+                            subscription_id,
+                            user_id: subscription.user_id,
+                            payment_type,
+                            amount_msat: invoice_amount,
+                            tax_msat: tax,
+                            description: desc,
+                            expires_in_secs: INVOICE_EXPIRE as u32,
+                        },
+                    )
                     .await?;
 
                 SubscriptionPayment {
@@ -1902,6 +1952,7 @@ impl SubscriptionHandler {
                         desc,
                         hex::encode(new_id),
                         &CryptoContext::payment(
+                            subscription.company_id,
                             new_id,
                             subscription.user_id,
                             subscription_id,
@@ -1973,6 +2024,7 @@ impl SubscriptionHandler {
                         desc,
                         hex::encode(new_id),
                         &CryptoContext::payment(
+                            subscription.company_id,
                             new_id,
                             subscription.user_id,
                             subscription_id,
@@ -2477,6 +2529,7 @@ impl SubscriptionHandler {
             });
         }
         let credit_covered = credit_amount(credit);
+        let priced_company_id = self.db.get_subscription(subscription_id).await?.company_id;
         Ok(match method {
             PaymentMethod::Gateway => bail!("Gateway is not a payment method"),
             PaymentMethod::Lightning => {
@@ -2492,15 +2545,18 @@ impl SubscriptionHandler {
                     credit_covered / 1000
                 );
                 let invoice = self
-                    .new_lightning_invoice(LightningInvoiceSpec {
-                        subscription_id,
-                        user_id,
-                        payment_type,
-                        amount_msat: total_amount,
-                        tax_msat: p.tax,
-                        description: desc,
-                        expires_in_secs: INVOICE_EXPIRE as u32,
-                    })
+                    .new_lightning_invoice(
+                        priced_company_id,
+                        LightningInvoiceSpec {
+                            subscription_id,
+                            user_id,
+                            payment_type,
+                            amount_msat: total_amount,
+                            tax_msat: p.tax,
+                            description: desc,
+                            expires_in_secs: INVOICE_EXPIRE as u32,
+                        },
+                    )
                     .await?;
                 SubscriptionPayment {
                     // Every caller here is a customer action (renew, upgrade, purchase);
@@ -2634,6 +2690,7 @@ impl SubscriptionHandler {
                         desc,
                         hex::encode(new_id),
                         &CryptoContext::payment(
+                            priced_company_id,
                             new_id,
                             user_id,
                             subscription_id,
@@ -2686,6 +2743,7 @@ impl SubscriptionHandler {
                         desc,
                         hex::encode(new_id),
                         &CryptoContext::payment(
+                            company_id,
                             new_id,
                             user_id,
                             subscription_id,
@@ -2812,11 +2870,19 @@ impl SubscriptionHandler {
                     bail!("NWC auto-renewal is not supported by this build")
                 }
             }
-            "revolut" if self.holds_gateway_method(&method) => {
+            "revolut"
+                if self
+                    .holds_gateway_method(sub.company_id, PaymentMethod::Revolut, &method)
+                    .await =>
+            {
                 self.auto_renew_via_gateway_card(sub_id, PaymentMethod::Revolut)
                     .await
             }
-            "stripe" if self.holds_gateway_method(&method) => {
+            "stripe"
+                if self
+                    .holds_gateway_method(sub.company_id, PaymentMethod::Stripe, &method)
+                    .await =>
+            {
                 self.auto_renew_via_gateway_card(sub_id, PaymentMethod::Stripe)
                     .await
             }

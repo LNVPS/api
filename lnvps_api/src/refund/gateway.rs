@@ -17,6 +17,22 @@ impl VmRefundHandler {
         self
     }
 
+    pub fn with_gateway_directory(mut self, directory: lnvps_api_common::GatewayDirectory) -> Self {
+        self.directory = Some(directory);
+        self
+    }
+
+    async fn refund_gateway(&self, vm_id: u64) -> Result<Option<Arc<dyn PaymentGateway>>> {
+        if let Some(g) = &self.gateway {
+            return Ok(Some(g.clone()));
+        }
+        let Some(directory) = &self.directory else {
+            return Ok(None);
+        };
+        let company_id = self.db.get_vm_company_id(vm_id).await?;
+        directory.in_flight(company_id).await
+    }
+
     pub async fn process_gateway(
         &self,
         vm_id: u64,
@@ -26,8 +42,8 @@ impl VmRefundHandler {
         destination: Option<&str>,
     ) -> Result<RefundOutcome> {
         let gateway = self
-            .gateway
-            .clone()
+            .refund_gateway(vm_id)
+            .await?
             .ok_or_else(|| anyhow!("the payment gateway is not configured"))?;
         let vm = self.db.get_vm(vm_id).await?;
         ensure!(!vm.deleted, "VM {} is already deleted", vm_id);

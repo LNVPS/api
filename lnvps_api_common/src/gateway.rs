@@ -169,9 +169,23 @@ pub struct GatewayClient {
 
 impl GatewayClient {
     pub fn new(config: &GatewayConfig) -> Self {
+        Self::from_parts(&config.url, &config.api_key)
+    }
+
+    pub fn from_parts(url: &str, api_key: &str) -> Self {
         Self {
-            client: Gateway::new(&config.url, &config.api_key),
+            client: Gateway::new(url, api_key),
         }
+    }
+
+    pub async fn check(&self) -> Result<usize> {
+        let methods = self
+            .client
+            .list_methods()
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("gateway check failed: {e}"))?;
+        Ok(methods.len())
     }
 }
 

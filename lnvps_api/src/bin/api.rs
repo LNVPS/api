@@ -86,6 +86,25 @@ impl Display for ExecMode {
     }
 }
 
+async fn log_gateway_source(db: &Arc<dyn lnvps_db::LNVpsDb>, yaml: bool) {
+    let rows = db
+        .list_payment_method_configs()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|c| c.provider_type == "gateway")
+        .count();
+    if rows > 0 {
+        info!(
+            "Payment gateway source: payment_method_config rows ({rows}), the YAML gateway section is ignored"
+        );
+    } else if yaml {
+        info!("Payment gateway source: YAML gateway section (legacy)");
+    } else {
+        info!("Payment gateway source: none, payments are created in process");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     env_logger::init();
@@ -351,6 +370,7 @@ async fn main() -> Result<(), Error> {
         }
         None => sub_handler,
     };
+    log_gateway_source(&db, settings.gateway.is_some()).await;
     sub_handler.vm_provisioner().init().await?;
 
     // On-chain provider for the worker's automated on-chain referral payouts.

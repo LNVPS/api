@@ -25,13 +25,17 @@ fn provider_name(method: PaymentMethod) -> Option<&'static str> {
 impl SubscriptionHandler {
     pub(crate) async fn gateway_saved_method(
         &self,
+        company_id: u64,
         user_id: u64,
         method: PaymentMethod,
         method_id: Option<u64>,
     ) -> Result<Option<UserPaymentMethod>> {
-        let (Some(provider), Some(_)) = (provider_name(method), self.card_gateway()) else {
+        let Some(provider) = provider_name(method) else {
             return Ok(None);
         };
+        if self.card_gateway_for(company_id, method).await?.is_none() {
+            return Ok(None);
+        }
         let now = Utc::now();
         let (year, month) = (now.year() as u16, now.month() as u16);
         let mut usable = self
@@ -49,6 +53,8 @@ impl SubscriptionHandler {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn charge_gateway_saved_method(
         &self,
+        company_id: u64,
+        method: PaymentMethod,
         saved: &UserPaymentMethod,
         subscription_id: u64,
         user_id: u64,
@@ -58,9 +64,10 @@ impl SubscriptionHandler {
         currency: &str,
         description: String,
     ) -> Result<GatewayCardCharge> {
-        let (Some(gateway), Some(gateway_method_id)) =
-            (self.card_gateway(), saved.gateway_method_id)
-        else {
+        let (Some(gateway), Some(gateway_method_id)) = (
+            self.card_gateway_for(company_id, method).await?,
+            saved.gateway_method_id,
+        ) else {
             bail!("Saved payment method is not held by the payment gateway");
         };
         let payment_id: [u8; 32] = rand::random();
@@ -85,8 +92,19 @@ impl SubscriptionHandler {
         })
     }
 
-    pub(crate) fn holds_gateway_method(&self, method: &UserPaymentMethod) -> bool {
-        self.card_gateway().is_some() && method.gateway_method_id.is_some()
+    pub(crate) async fn holds_gateway_method(
+        &self,
+        company_id: u64,
+        method: PaymentMethod,
+        saved: &UserPaymentMethod,
+    ) -> bool {
+        saved.gateway_method_id.is_some()
+            && self
+                .card_gateway_for(company_id, method)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
     }
 
     pub(crate) async fn auto_renew_via_gateway_card(
@@ -94,7 +112,8 @@ impl SubscriptionHandler {
         sub_id: u64,
         method: PaymentMethod,
     ) -> Result<SubscriptionPayment> {
-        match self.off_session {
+        let company_id = self.db().get_subscription(sub_id).await?.company_id;
+        match self.gateways().off_session_for(company_id, method).await? {
             OffSessionRenewals::Off => {
                 bail!("Off-session card renewals through the gateway are not enabled")
             }
@@ -120,9 +139,19 @@ impl SubscriptionHandler {
         }
     }
 
-    pub(crate) fn wants_gateway_saved(&self, method: PaymentMethod, mode: &RenewMode) -> bool {
-        self.card_gateway().is_some()
-            && provider_name(method).is_some()
+    pub(crate) async fn wants_gateway_saved(
+        &self,
+        company_id: u64,
+        method: PaymentMethod,
+        mode: &RenewMode,
+    ) -> bool {
+        provider_name(method).is_some()
             && matches!(mode, RenewMode::Saved { .. })
+            && self
+                .card_gateway_for(company_id, method)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
     }
 }

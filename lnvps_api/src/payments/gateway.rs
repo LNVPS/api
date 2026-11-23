@@ -152,9 +152,16 @@ pub async fn cancel_expired_gateway_payments(
 ) -> Result<usize> {
     let mut cancelled = 0;
     for mut payment in db.list_expired_unpaid_gateway_payments(Utc::now()).await? {
-        let gateway = match payment.payment_method {
-            PaymentMethod::Lightning => Some(sub_handler.lightning_gateway()),
-            _ => sub_handler.card_gateway(),
+        let gateway = match sub_handler.payment_gateway_for(&payment).await {
+            Ok(g) => g,
+            Err(e) => {
+                warn!(
+                    "Cannot find gateway for payment {}: {}",
+                    hex::encode(&payment.id),
+                    e
+                );
+                continue;
+            }
         };
         let Some(gateway) = gateway else {
             continue;
@@ -222,14 +229,20 @@ pub async fn handle_gateway_event(
     }
     let result = sub_handler.complete_payment(&payment).await?;
     cancel_competing(
-        &sub_handler.lightning_gateway(),
+        &sub_handler.payment_gateway_for(&payment).await?,
         result.expired_competing_upgrades,
     )
     .await;
     Ok(GatewayEventOutcome::Settled)
 }
 
-async fn cancel_competing(gateway: &Arc<dyn PaymentGateway>, competing: Vec<SubscriptionPayment>) {
+async fn cancel_competing(
+    gateway: &Option<Arc<dyn PaymentGateway>>,
+    competing: Vec<SubscriptionPayment>,
+) {
+    let Some(gateway) = gateway else {
+        return;
+    };
     for p in competing {
         if !is_gateway_payment(p.external_id.as_deref()) {
             continue;
