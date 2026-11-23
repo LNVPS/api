@@ -2319,7 +2319,7 @@ fn build_payment_methods_response(
 
     let mut ret: Vec<ApiPaymentInfo> = configs
         .into_iter()
-        .filter(|c| c.enabled)
+        .filter(|c| c.enabled && c.payment_method != PaymentMethod::Gateway)
         .map(|config| {
             // Use supported_currencies from DB if set, otherwise fall back to defaults
             let currencies = if config.supported_currencies.is_empty() {
@@ -2391,6 +2391,7 @@ fn default_currencies_for_method(method: PaymentMethod) -> Vec<ApiCurrency> {
         PaymentMethod::Revolut => vec![ApiCurrency::EUR, ApiCurrency::USD],
         PaymentMethod::Paypal => vec![ApiCurrency::EUR, ApiCurrency::USD],
         PaymentMethod::Stripe => vec![ApiCurrency::EUR, ApiCurrency::USD],
+        PaymentMethod::Gateway => vec![],
     }
 }
 

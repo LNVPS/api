@@ -2758,6 +2758,7 @@ pub enum PaymentMethod {
     OnChain,
     /// A cryptocurrency (XMR, LTC, ETH, USDTTRC) paid through a third-party swap into our on-chain Bitcoin wallet
     FixedFloat,
+    Gateway,
 }
 
 #[derive(Type, Clone, Copy, Debug, Default, PartialEq)]
@@ -2777,6 +2778,7 @@ impl Display for PaymentMethod {
             PaymentMethod::Stripe => write!(f, "Stripe"),
             PaymentMethod::OnChain => write!(f, "OnChain"),
             PaymentMethod::FixedFloat => write!(f, "FixedFloat"),
+            PaymentMethod::Gateway => write!(f, "Gateway"),
         }
     }
 }
@@ -2792,6 +2794,7 @@ impl FromStr for PaymentMethod {
             "stripe" => Ok(PaymentMethod::Stripe),
             "onchain" => Ok(PaymentMethod::OnChain),
             "fixedfloat" => Ok(PaymentMethod::FixedFloat),
+            "gateway" => Ok(PaymentMethod::Gateway),
             _ => bail!("Unknown payment method: {}", s),
         }
     }
@@ -4618,6 +4621,7 @@ mod tests {
             ("stripe", PaymentMethod::Stripe),
             ("onchain", PaymentMethod::OnChain),
             ("fixedfloat", PaymentMethod::FixedFloat),
+            ("gateway", PaymentMethod::Gateway),
         ] {
             assert_eq!(PaymentMethod::from_str(s).unwrap(), m);
         }
@@ -4965,7 +4969,48 @@ pub enum ProviderConfig {
     /// Cryptocurrency payments swapped to Bitcoin through FixedFloat
     #[serde(rename = "fixedfloat")]
     FixedFloat(FixedFloatProviderConfig),
+    Gateway(GatewayProviderConfig),
 }
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GatewayOffSession {
+    #[default]
+    Off,
+    DryRun,
+    Live,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GatewayProviderConfig {
+    pub url: String,
+    pub api_key: String,
+    pub webhook_secret: String,
+    #[serde(default = "default_gateway_tolerance")]
+    pub tolerance_seconds: i64,
+    #[serde(default)]
+    pub off_session_renewals: GatewayOffSession,
+    #[serde(default)]
+    pub handles: Vec<PaymentMethod>,
+}
+
+fn default_gateway_tolerance() -> i64 {
+    300
+}
+
+impl GatewayProviderConfig {
+    pub fn handles_method(&self, method: PaymentMethod) -> bool {
+        self.handles.contains(&method)
+    }
+}
+
+pub const GATEWAY_HANDLEABLE: [PaymentMethod; 5] = [
+    PaymentMethod::Lightning,
+    PaymentMethod::OnChain,
+    PaymentMethod::FixedFloat,
+    PaymentMethod::Revolut,
+    PaymentMethod::Stripe,
+];
 
 impl ProviderConfig {
     /// Get the provider type string for this config
@@ -4977,6 +5022,7 @@ impl ProviderConfig {
             ProviderConfig::Paypal(_) => "paypal",
             ProviderConfig::OnChain(_) => "onchain",
             ProviderConfig::FixedFloat(_) => "fixedfloat",
+            ProviderConfig::Gateway(_) => "gateway",
         }
     }
 
@@ -4989,6 +5035,7 @@ impl ProviderConfig {
             ProviderConfig::Paypal(_) => PaymentMethod::Paypal,
             ProviderConfig::OnChain(_) => PaymentMethod::OnChain,
             ProviderConfig::FixedFloat(_) => PaymentMethod::FixedFloat,
+            ProviderConfig::Gateway(_) => PaymentMethod::Gateway,
         }
     }
 
@@ -5028,6 +5075,13 @@ impl ProviderConfig {
     pub fn as_onchain(&self) -> Option<&OnChainProviderConfig> {
         match self {
             ProviderConfig::OnChain(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+
+    pub fn as_gateway(&self) -> Option<&GatewayProviderConfig> {
+        match self {
+            ProviderConfig::Gateway(cfg) => Some(cfg),
             _ => None,
         }
     }

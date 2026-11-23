@@ -1676,6 +1676,7 @@ impl SubscriptionHandler {
             });
         }
         Ok(match method {
+            PaymentMethod::Gateway => bail!("Gateway is not a payment method"),
             PaymentMethod::Lightning => {
                 ensure!(
                     converted_currency == Currency::BTC,
@@ -2477,6 +2478,7 @@ impl SubscriptionHandler {
         }
         let credit_covered = credit_amount(credit);
         Ok(match method {
+            PaymentMethod::Gateway => bail!("Gateway is not a payment method"),
             PaymentMethod::Lightning => {
                 ensure!(
                     p.currency == Currency::BTC,

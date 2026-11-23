@@ -647,6 +647,7 @@ impl ApiVmPayment {
                     ApiPaymentData::Revolut { token: data.token }
                 }
                 PaymentMethod::Paypal => anyhow::bail!("PayPal payments are not supported"),
+                PaymentMethod::Gateway => anyhow::bail!("Gateway is not a payment method"),
                 PaymentMethod::Stripe => {
                     #[derive(Deserialize)]
                     struct StripeData {
@@ -796,6 +797,7 @@ impl From<PaymentMethod> for ApiPaymentMethod {
             PaymentMethod::Stripe => ApiPaymentMethod::Stripe,
             PaymentMethod::OnChain => ApiPaymentMethod::OnChain,
             PaymentMethod::FixedFloat => ApiPaymentMethod::FixedFloat,
+            PaymentMethod::Gateway => ApiPaymentMethod::default(),
         }
     }
 }
@@ -1498,7 +1500,9 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
                     .unwrap_or_default();
                 ApiPaymentData::Stripe { session_id }
             }
-            PaymentMethod::Paypal => ApiPaymentData::Lightning(String::new()),
+            PaymentMethod::Paypal | PaymentMethod::Gateway => {
+                ApiPaymentData::Lightning(String::new())
+            }
         };
 
         Self {

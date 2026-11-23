@@ -201,6 +201,9 @@ pub fn map_config(
                 "webhook_secret": s.webhook_secret,
             }),
         ),
+        ProviderConfig::Gateway(_) => {
+            bail!("a gateway row is not a provider of the gateway")
+        }
         ProviderConfig::Paypal(_) => {
             bail!("PayPal needs a webhook_id the old config does not have, add it in the console")
         }
