@@ -152,6 +152,159 @@ async fn send_webhook(req: Request) -> StatusCode {
 mod tests {
     use super::*;
     use axum::http::{HeaderMap, HeaderName, HeaderValue};
+    use lnvps_api_common::{MockDb, MockExchangeRate, VatClient};
+    use lnvps_db::{
+        GatewayOffSession, GatewayProviderConfig, LNVpsDb, LNVpsDbBase, PaymentMethod,
+        PaymentMethodConfig, ProviderConfig,
+    };
+    use std::sync::Arc;
+
+    async fn webhook_state(db: Arc<MockDb>, yaml_secret: Option<&str>) -> RouterState {
+        use crate::mocks::{MockNode, MockOnChainProvider};
+        let rates = Arc::new(MockExchangeRate::new());
+        let commander: Arc<dyn lnvps_api_common::WorkCommander> =
+            Arc::new(lnvps_api_common::ChannelWorkCommander::new());
+        let sub_handler = crate::subscription::SubscriptionHandler::new(
+            crate::settings::mock_settings(),
+            db.clone(),
+            Arc::new(MockNode::default()),
+            Arc::new(MockOnChainProvider::default()),
+            None,
+            rates.clone(),
+            VatClient::new(),
+            commander.clone(),
+            lnvps_api_common::VmStateCache::new(),
+        )
+        .unwrap();
+        let mut settings = crate::settings::mock_settings();
+        settings.gateway = yaml_secret.map(|s| lnvps_api_common::GatewayConfig {
+            url: "http://yaml".into(),
+            api_key: "k".into(),
+            webhook_secret: s.into(),
+            methods: vec![],
+            webhook_tolerance_seconds: 0,
+            off_session_renewals: Default::default(),
+        });
+        RouterState {
+            db: db.clone(),
+            state: lnvps_api_common::VmStateCache::new(),
+            sub_handler,
+            history: lnvps_api_common::VmHistoryLogger::new(db),
+            settings,
+            rates,
+            work_sender: commander,
+            feedback: None,
+            geoip: None,
+        }
+    }
+
+    fn row(company: u64, secret: &str, enabled: bool) -> PaymentMethodConfig {
+        PaymentMethodConfig::new_with_config(
+            company,
+            PaymentMethod::Gateway,
+            "Gateway".into(),
+            enabled,
+            ProviderConfig::Gateway(GatewayProviderConfig {
+                url: "http://gw".into(),
+                api_key: "k".into(),
+                webhook_secret: secret.into(),
+                tolerance_seconds: 0,
+                off_session_renewals: GatewayOffSession::Off,
+                handles: vec![PaymentMethod::Lightning],
+            }),
+        )
+    }
+
+    const BODY: &str = r#"{"id":"e1","type":"payment.paid","data":{"payment":{"reference":"ab","status":"paid"}}}"#;
+
+    fn signed(secret: &str) -> String {
+        format!(
+            "t=1700000000,v1={}",
+            payment_gateway_client::sign_webhook(BODY.as_bytes(), secret, 1700000000)
+        )
+    }
+
+    #[tokio::test]
+    async fn webhook_is_verified_with_the_secret_of_the_enabled_row() {
+        let db = Arc::new(MockDb::default());
+        db.insert_payment_method_config(&row(1, "row-secret", true))
+            .await
+            .unwrap();
+        let state = webhook_state(db, Some("yaml-secret")).await;
+
+        let event = verify_gateway_webhook(&state, BODY.as_bytes(), Some(&signed("row-secret")))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(event.kind, "payment.paid");
+    }
+
+    #[tokio::test]
+    async fn webhook_with_a_wrong_secret_is_refused() {
+        let db = Arc::new(MockDb::default());
+        db.insert_payment_method_config(&row(1, "row-secret", true))
+            .await
+            .unwrap();
+        let state = webhook_state(db, None).await;
+
+        let res = verify_gateway_webhook(&state, BODY.as_bytes(), Some(&signed("wrong"))).await;
+
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn yaml_secret_is_not_accepted_once_a_row_exists() {
+        let db = Arc::new(MockDb::default());
+        db.insert_payment_method_config(&row(1, "row-secret", true))
+            .await
+            .unwrap();
+        let state = webhook_state(db, Some("yaml-secret")).await;
+
+        let res =
+            verify_gateway_webhook(&state, BODY.as_bytes(), Some(&signed("yaml-secret"))).await;
+
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn webhook_falls_back_to_the_yaml_secret_without_a_row() {
+        let db = Arc::new(MockDb::default());
+        let state = webhook_state(db, Some("yaml-secret")).await;
+
+        let ok = verify_gateway_webhook(&state, BODY.as_bytes(), Some(&signed("yaml-secret")))
+            .await
+            .unwrap();
+
+        assert!(ok.is_some());
+    }
+
+    #[tokio::test]
+    async fn webhook_is_not_found_with_no_row_and_no_yaml() {
+        let db = Arc::new(MockDb::default());
+        let state = webhook_state(db, None).await;
+
+        let res = verify_gateway_webhook(&state, BODY.as_bytes(), Some(&signed("x")))
+            .await
+            .unwrap();
+
+        assert!(res.is_none());
+    }
+
+    #[tokio::test]
+    async fn webhook_with_only_disabled_rows_is_not_found() {
+        let db = Arc::new(MockDb::default());
+        db.insert_payment_method_config(&row(1, "row-secret", false))
+            .await
+            .unwrap();
+        let state = webhook_state(db, Some("yaml-secret")).await;
+
+        let res = verify_gateway_webhook(&state, BODY.as_bytes(), Some(&signed("row-secret")))
+            .await
+            .unwrap();
+
+        assert!(res.is_none());
+    }
 
     /// Regression (F-01): a header value carrying a non-UTF-8 `obs-text` byte
     /// must not panic. `HeaderValue::to_str()` returns `Err` for these, and the
