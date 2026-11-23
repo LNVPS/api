@@ -3680,6 +3680,33 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn gateway_payment_stats(
+        &self,
+        company_id: u64,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> DbResult<(u64, Option<chrono::DateTime<chrono::Utc>>)> {
+        let subs = self.subscriptions.lock().await;
+        let payments = self.subscription_payments.lock().await;
+        let mine: Vec<_> = payments
+            .iter()
+            .filter(|p| {
+                p.external_id
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("pgw:"))
+                    && subs
+                        .get(&p.subscription_id)
+                        .is_some_and(|s| s.company_id == company_id)
+            })
+            .collect();
+        let count = mine.iter().filter(|p| p.created >= since).count() as u64;
+        let last = mine
+            .iter()
+            .filter(|p| p.is_paid)
+            .filter_map(|p| p.paid_at)
+            .max();
+        Ok((count, last))
+    }
+
     async fn get_subscription_payment_with_company(
         &self,
         id: &Vec<u8>,

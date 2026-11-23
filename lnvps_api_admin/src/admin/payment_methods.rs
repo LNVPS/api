@@ -1,11 +1,11 @@
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
-    AdminPaymentMethodConfigInfo, CreatePaymentMethodConfigRequest,
+    AdminPaymentMethodConfigInfo, AdminPaymentMethodType, CreatePaymentMethodConfigRequest,
     UpdatePaymentMethodConfigRequest,
 };
 use axum::extract::{Path, Query, State};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery,
@@ -24,6 +24,123 @@ pub fn router() -> Router<RouterState> {
                 .patch(admin_update_payment_method)
                 .delete(admin_delete_payment_method),
         )
+        .route(
+            "/api/admin/v1/payment_methods/{id}/gateway/test",
+            post(admin_test_gateway),
+        )
+        .route(
+            "/api/admin/v1/payment_methods/{id}/gateway/status",
+            get(admin_gateway_status),
+        )
+}
+
+fn gateway_row_of(
+    config: &lnvps_db::PaymentMethodConfig,
+) -> Result<lnvps_db::GatewayProviderConfig, ApiError> {
+    config
+        .get_provider_config()
+        .and_then(|c| c.as_gateway().cloned())
+        .ok_or_else(|| ApiError::bad_request("This payment method is not a gateway"))
+}
+
+#[derive(serde::Serialize)]
+struct GatewayTestResult {
+    ok: bool,
+    message: String,
+}
+
+async fn admin_test_gateway(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<GatewayTestResult> {
+    auth.require_permission(AdminResource::PaymentMethodConfig, AdminAction::View)?;
+    let config = this.db.get_payment_method_config(id).await?;
+    let gw = gateway_row_of(&config)?;
+    let client = lnvps_api_common::GatewayClient::from_parts(&gw.url, &gw.api_key);
+    let result = match client.check().await {
+        Ok(n) => GatewayTestResult {
+            ok: true,
+            message: format!("Connected, the gateway lists {n} payment methods"),
+        },
+        Err(e) => GatewayTestResult {
+            ok: false,
+            message: format!("Could not reach the gateway: {e}"),
+        },
+    };
+    ApiData::ok(result)
+}
+
+#[derive(serde::Serialize)]
+struct GatewayStatus {
+    enabled: bool,
+    handles: Vec<AdminPaymentMethodType>,
+    last_paid_webhook_at: Option<chrono::DateTime<chrono::Utc>>,
+    payments_last_24h: u64,
+}
+
+async fn admin_gateway_status(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<GatewayStatus> {
+    auth.require_permission(AdminResource::PaymentMethodConfig, AdminAction::View)?;
+    let config = this.db.get_payment_method_config(id).await?;
+    let gw = gateway_row_of(&config)?;
+    let since = chrono::Utc::now() - chrono::Duration::hours(24);
+    let (count, last) = this
+        .db
+        .gateway_payment_stats(config.company_id, since)
+        .await?;
+    ApiData::ok(GatewayStatus {
+        enabled: config.enabled,
+        handles: gw
+            .handles
+            .iter()
+            .copied()
+            .map(AdminPaymentMethodType::from)
+            .collect(),
+        last_paid_webhook_at: last,
+        payments_last_24h: count,
+    })
+}
+
+async fn validate_gateway_row(
+    this: &RouterState,
+    config: &lnvps_db::PaymentMethodConfig,
+) -> anyhow::Result<()> {
+    let Some(gw) = config
+        .get_provider_config()
+        .and_then(|c| c.as_gateway().cloned())
+    else {
+        return Ok(());
+    };
+    anyhow::ensure!(!gw.url.trim().is_empty(), "The gateway url is required");
+    anyhow::ensure!(
+        !gw.api_key.is_empty() && !gw.webhook_secret.is_empty(),
+        "The gateway api_key and webhook_secret are required"
+    );
+    for m in &gw.handles {
+        anyhow::ensure!(
+            lnvps_db::GATEWAY_HANDLEABLE.contains(m),
+            "The gateway cannot handle {m} payments"
+        );
+    }
+    if !config.enabled {
+        return Ok(());
+    }
+    let others = this
+        .db
+        .list_payment_method_configs_for_company(config.company_id)
+        .await?;
+    let clash = others
+        .iter()
+        .any(|c| c.id != config.id && c.enabled && c.provider_type == "gateway");
+    anyhow::ensure!(
+        !clash,
+        "This company already has an enabled gateway payment method, disable it first"
+    );
+    Ok(())
 }
 
 /// List all payment method configurations
@@ -73,6 +190,7 @@ async fn admin_create_payment_method(
 
     let config = request.to_payment_method_config()?;
     require_onchain_for_fixedfloat(&this, &config).await?;
+    validate_gateway_row(&this, &config).await?;
 
     let config_id = this.db.insert_payment_method_config(&config).await?;
 
@@ -180,6 +298,7 @@ async fn admin_update_payment_method(
     }
 
     require_onchain_for_fixedfloat(&this, &config).await?;
+    validate_gateway_row(&this, &config).await?;
 
     this.db.update_payment_method_config(&config).await?;
 

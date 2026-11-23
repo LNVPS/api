@@ -4609,6 +4609,27 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn gateway_payment_stats(
+        &self,
+        company_id: u64,
+        since: DateTime<Utc>,
+    ) -> DbResult<(u64, Option<DateTime<Utc>>)> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM subscription_payment sp JOIN subscription s ON s.id = sp.subscription_id WHERE s.company_id = ? AND sp.external_id LIKE 'pgw:%' AND sp.created >= ?",
+        )
+        .bind(company_id)
+        .bind(since)
+        .fetch_one(&self.db)
+        .await?;
+        let last: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT MAX(sp.paid_at) FROM subscription_payment sp JOIN subscription s ON s.id = sp.subscription_id WHERE s.company_id = ? AND sp.external_id LIKE 'pgw:%' AND sp.is_paid = 1",
+        )
+        .bind(company_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok((count as u64, last))
+    }
+
     async fn get_subscription_payment_with_company(
         &self,
         id: &Vec<u8>,
