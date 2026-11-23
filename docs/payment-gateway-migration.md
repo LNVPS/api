@@ -81,10 +81,39 @@ Without a `gateway` section, or without `lightning` in `methods`, nothing change
 - `payment.expired` and `payment.cancelled` events are logged only. The LNVPS row expires by its own `expires` column. A sweep (every 60 seconds, only when a `gateway` section exists) cancels the gateway payment of every unpaid `pgw:` row past its `expires`, then renames its `external_id` to `pgw-cancelled:<id>` so it is cancelled once. A failed cancel is retried on the next pass.
 - `attempt.failed` expires the unpaid LNVPS row and notifies the user; it never extends the subscription. `refund.completed` books one `Refund` row (keyed by the gateway refund id, capped at what is still refundable) and never re-credits or touches expiry. Both ignore references that are not `pgw:` payments of this deployment, and replays change nothing.
 
+## Switch a company over
+
+The gateway is a payment method row (`provider_type` `gateway`) an admin adds, enables and disables per company. No config edit or deploy is needed to switch.
+
+### Precedence
+
+1. If the company has any `gateway` row, the rows decide and the YAML `gateway:` section is ignored for that company. A disabled row means in process, not YAML.
+2. If the company has no row, the legacy YAML `gateway:` section applies (`methods`, `off-session-renewals`).
+3. With neither, payments are created in process.
+
+The API logs which source is active at startup: `Payment gateway source: payment_method_config rows`, `YAML gateway section (legacy)` or `none`.
+
+A row serves a payment method only while it is enabled and lists the method in `handles`. `handles` takes `lightning`, `onchain`, `fixedfloat`, `revolut` and `stripe`. PayPal is not accepted (the gateway cannot take it yet). A company can have one enabled gateway row, the admin API refuses a second.
+
+The row holds `url`, `api_key`, `webhook_secret`, `tolerance_seconds` (default 300) and `off_session_renewals` (`off` default, `dry-run`, `live`). The admin API never returns the two secrets, only `has_api_key` and `has_webhook_secret`, and a PATCH that omits them keeps the stored values.
+
+### Runbook
+
+1. Dry run: `import_gateway_providers --config config.yaml --tenant <id> --company-id <company> --create-gateway-row --gateway-api-key ... --webhook-secret ...` (or `GATEWAY_API_KEY` and `GATEWAY_WEBHOOK_SECRET`). It lists the providers it would register and the gateway row it would add, and changes nothing.
+2. Apply: the same command with `--apply` and `GATEWAY_IMPORT_CONFIRM=yes` and `GATEWAY_ADMIN_TOKEN`. It registers the company's LND, Revolut, Stripe and chain providers on the gateway and adds the `gateway` row **disabled**, with `handles` set to the methods it registered. It prints the next steps.
+3. In the gateway, add a webhook endpoint `https://<api>/api/v1/webhook/gateway` for `payment.paid`, `attempt.failed`, `refund.completed`, `payment.expired` and `payment.cancelled`. If its secret differs from the one in the row, PATCH the row.
+4. `POST /api/admin/v1/payment_methods/<id>/gateway/test` checks the url and key and reports a clear error if the gateway is unreachable or rejects the key.
+5. `PATCH /api/admin/v1/payment_methods/<id>` with `{"enabled": true}`. New payments of the handled methods now go through the gateway. The change is immediate, no restart.
+6. Watch `GET /api/admin/v1/payment_methods/<id>/gateway/status`: methods handled, time of the last paid gateway payment and the number of gateway payments in the last 24 hours.
+
+### Rollback
+
+`PATCH` the row with `{"enabled": false}` (or remove a method from `handles`). New payments go back in process at once. Payments already created on the gateway finish there: their `external_id` starts with `pgw:`, the webhook secret of the row still verifies while the row exists (enabled or not), and expiry cancellation still calls the gateway. Keep the row (disabled) rather than deleting it while gateway payments are open.
+
 ## Cutover
 
 Enable on staging first, run the checks above for a few days, then add the section to production config. No data migration is needed for stage 2.
 
-## Rollback
+## Rollback (YAML section)
 
 Remove the `gateway` section (or `lightning` from `methods`) and restart. New invoices come from the node again. Gateway invoices already issued keep settling through the webhook as long as the section's `webhook-secret` is kept, so for a clean rollback leave the section in with `methods: []`.

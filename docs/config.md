@@ -28,8 +28,8 @@ read-only: false
 max-prepay-days: 365
 ```
 
-Optional `gateway` section (staged migration to the payment gateway, see
-[payment-gateway-migration.md](payment-gateway-migration.md)):
+Optional `gateway` section (legacy way to use the payment gateway, see
+[payment-gateway-migration.md](payment-gateway-migration.md)). Prefer a `gateway` payment method row per company, which an admin enables and disables without a config edit or deploy. A company with a gateway row ignores this section; companies without one still use it:
 
 ```yaml
 gateway:

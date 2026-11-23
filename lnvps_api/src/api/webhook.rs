@@ -76,7 +76,7 @@ pub(crate) async fn verify_gateway_webhook(
         .collect();
     if !rows.is_empty() {
         let mut last_err = None;
-        for row in rows.iter().filter(|r| r.enabled) {
+        for row in rows.iter() {
             match parse_gateway_event_with(
                 body,
                 signature,
@@ -292,18 +292,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_with_only_disabled_rows_is_not_found() {
+    async fn webhook_still_verifies_with_a_disabled_row_so_in_flight_payments_settle() {
         let db = Arc::new(MockDb::default());
         db.insert_payment_method_config(&row(1, "row-secret", false))
             .await
             .unwrap();
         let state = webhook_state(db, Some("yaml-secret")).await;
 
-        let res = verify_gateway_webhook(&state, BODY.as_bytes(), Some(&signed("row-secret")))
+        let ok = verify_gateway_webhook(&state, BODY.as_bytes(), Some(&signed("row-secret")))
             .await
             .unwrap();
+        let bad =
+            verify_gateway_webhook(&state, BODY.as_bytes(), Some(&signed("yaml-secret"))).await;
 
-        assert!(res.is_none());
+        assert!(ok.is_some());
+        assert!(bad.is_err());
     }
 
     /// Regression (F-01): a header value carrying a non-UTF-8 `obs-text` byte
