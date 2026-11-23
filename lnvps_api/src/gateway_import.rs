@@ -247,6 +247,7 @@ pub struct ImportLine {
 #[derive(Debug, Default)]
 pub struct ImportReport {
     pub lines: Vec<ImportLine>,
+    pub gateway_rows: Vec<GatewayRowLine>,
     pub applied: bool,
 }
 
@@ -272,6 +273,27 @@ pub struct ImportOptions {
     pub tenant: u64,
     pub apply: bool,
     pub company_id: Option<u64>,
+    pub gateway_row: Option<GatewayRowSpec>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayRowSpec {
+    pub url: String,
+    pub api_key: String,
+    pub webhook_secret: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GatewayRowAction {
+    Create { handles: Vec<PaymentMethod> },
+    AlreadyPresent { id: u64 },
+    Skip { reason: String },
+}
+
+#[derive(Debug)]
+pub struct GatewayRowLine {
+    pub company_id: u64,
+    pub action: GatewayRowAction,
 }
 
 pub async fn import_providers(
@@ -285,6 +307,7 @@ pub async fn import_providers(
         .await?
         .into_iter()
         .filter(|c| opts.company_id.is_none_or(|id| c.company_id == id))
+        .filter(|c| c.provider_type != lnvps_api_common::GATEWAY_PROVIDER_TYPE)
         .collect();
     let multiple_companies = configs
         .iter()
@@ -353,7 +376,96 @@ pub async fn import_providers(
         }
         report.lines.push(line(ImportAction::Create { disabled }));
     }
+    if let Some(spec) = &opts.gateway_row {
+        add_gateway_rows(db, opts, spec, &mut report).await?;
+    }
     Ok(report)
+}
+
+async fn add_gateway_rows(
+    db: &Arc<dyn LNVpsDb>,
+    opts: &ImportOptions,
+    spec: &GatewayRowSpec,
+    report: &mut ImportReport,
+) -> Result<()> {
+    let Some(company_id) = opts.company_id else {
+        bail!("creating the gateway row needs --company-id");
+    };
+    let all = db
+        .list_payment_method_configs_for_company(company_id)
+        .await?;
+    if let Some(existing) = all
+        .iter()
+        .find(|c| c.provider_type == lnvps_api_common::GATEWAY_PROVIDER_TYPE)
+    {
+        report.gateway_rows.push(GatewayRowLine {
+            company_id,
+            action: GatewayRowAction::AlreadyPresent { id: existing.id },
+        });
+        return Ok(());
+    }
+    let mut handles: Vec<PaymentMethod> = Vec::new();
+    for l in report.lines.iter().filter(|l| {
+        l.company_id == company_id
+            && matches!(
+                l.action,
+                ImportAction::Create { .. } | ImportAction::AlreadyPresent { .. }
+            )
+    }) {
+        if lnvps_db::GATEWAY_HANDLEABLE.contains(&l.method) && !handles.contains(&l.method) {
+            handles.push(l.method);
+        }
+    }
+    if handles.is_empty() {
+        report.gateway_rows.push(GatewayRowLine {
+            company_id,
+            action: GatewayRowAction::Skip {
+                reason: "no provider of this company can be served by the gateway".into(),
+            },
+        });
+        return Ok(());
+    }
+    if opts.apply {
+        let row = PaymentMethodConfig::new_with_config(
+            company_id,
+            PaymentMethod::Gateway,
+            "Payment gateway".to_string(),
+            false,
+            ProviderConfig::Gateway(lnvps_db::GatewayProviderConfig {
+                url: spec.url.clone(),
+                api_key: spec.api_key.clone(),
+                webhook_secret: spec.webhook_secret.clone(),
+                tolerance_seconds: 300,
+                off_session_renewals: lnvps_db::GatewayOffSession::Off,
+                handles: handles.clone(),
+            }),
+        );
+        db.insert_payment_method_config(&row).await?;
+    }
+    report.gateway_rows.push(GatewayRowLine {
+        company_id,
+        action: GatewayRowAction::Create { handles },
+    });
+    Ok(())
+}
+
+pub fn next_steps(report: &ImportReport, gateway_url: &str) -> String {
+    let mut out = String::new();
+    for r in &report.gateway_rows {
+        if let GatewayRowAction::Create { .. } = r.action {
+            out.push_str(&format!(
+                "\nNext steps for company {}:\n\
+                 1. In the gateway, add a webhook endpoint {}{} and copy its secret into the row if it differs.\n\
+                 2. In the admin API, call POST /api/admin/v1/payment_methods/<id>/gateway/test on the new row.\n\
+                 3. PATCH the row with enabled=true to switch new payments over.\n\
+                 Rollback: PATCH enabled=false. New payments go back in process, in-flight ones finish on the gateway.\n",
+                r.company_id,
+                gateway_url.trim_end_matches('/'),
+                lnvps_api_common::GATEWAY_WEBHOOK_PATH,
+            ));
+        }
+    }
+    out
 }
 
 pub fn render_report(report: &ImportReport) -> String {
@@ -377,6 +489,16 @@ pub fn render_report(report: &ImportReport) -> String {
         report.present(),
         report.skipped()
     ));
+    for r in &report.gateway_rows {
+        let what = match &r.action {
+            GatewayRowAction::Create { handles } => {
+                format!("create disabled, handles {handles:?}")
+            }
+            GatewayRowAction::AlreadyPresent { id } => format!("already present as row {id}"),
+            GatewayRowAction::Skip { reason } => format!("skip: {reason}"),
+        };
+        out.push_str(&format!("gateway row company {}: {}\n", r.company_id, what));
+    }
     out
 }
 
@@ -456,7 +578,102 @@ mod tests {
             tenant: 7,
             apply,
             company_id: None,
+            gateway_row: None,
         }
+    }
+
+    fn row_spec() -> GatewayRowSpec {
+        GatewayRowSpec {
+            url: "https://pay.example".into(),
+            api_key: "key".into(),
+            webhook_secret: "whsec".into(),
+        }
+    }
+
+    fn row_opts(apply: bool, company: u64) -> ImportOptions {
+        ImportOptions {
+            tenant: 7,
+            apply,
+            company_id: Some(company),
+            gateway_row: Some(row_spec()),
+        }
+    }
+
+    async fn gateway_rows(db: &Arc<dyn LNVpsDb>, company: u64) -> Vec<PaymentMethodConfig> {
+        db.list_payment_method_configs_for_company(company)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.provider_type == "gateway")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn dry_run_creates_no_gateway_row() {
+        let db = db_with(vec![cfg(1, "main", true, ProviderConfig::Lnd(lnd()))]).await;
+        let report = import_providers(&db, &FakeAdmin::default(), &Files, &row_opts(false, 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            report.gateway_rows[0].action,
+            GatewayRowAction::Create {
+                handles: vec![PaymentMethod::Lightning]
+            }
+        );
+        assert!(gateway_rows(&db, 1).await.is_empty());
+        assert!(render_report(&report).contains("create disabled"));
+    }
+
+    #[tokio::test]
+    async fn apply_creates_a_disabled_gateway_row_with_handles() {
+        let db = db_with(vec![
+            cfg(1, "main", true, ProviderConfig::Lnd(lnd())),
+            cfg(2, "other", true, ProviderConfig::Lnd(lnd())),
+        ])
+        .await;
+        let report = import_providers(&db, &FakeAdmin::default(), &Files, &row_opts(true, 1))
+            .await
+            .unwrap();
+        let rows = gateway_rows(&db, 1).await;
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].enabled);
+        let gw = rows[0].get_provider_config().unwrap();
+        let gw = gw.as_gateway().unwrap();
+        assert_eq!(gw.handles, vec![PaymentMethod::Lightning]);
+        assert_eq!(gw.webhook_secret, "whsec");
+        assert!(gateway_rows(&db, 2).await.is_empty());
+        let steps = next_steps(&report, "https://pay.example/");
+        assert!(steps.contains("https://pay.example/api/v1/webhook/gateway"));
+        assert!(steps.contains("enabled=true"));
+        assert!(steps.contains("Rollback"));
+    }
+
+    #[tokio::test]
+    async fn a_second_apply_does_not_add_another_gateway_row() {
+        let db = db_with(vec![cfg(1, "main", true, ProviderConfig::Lnd(lnd()))]).await;
+        import_providers(&db, &FakeAdmin::default(), &Files, &row_opts(true, 1))
+            .await
+            .unwrap();
+        let report = import_providers(&db, &FakeAdmin::default(), &Files, &row_opts(true, 1))
+            .await
+            .unwrap();
+        assert!(matches!(
+            report.gateway_rows[0].action,
+            GatewayRowAction::AlreadyPresent { .. }
+        ));
+        assert_eq!(gateway_rows(&db, 1).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_row_needs_a_company() {
+        let db = db_with(vec![cfg(1, "main", true, ProviderConfig::Lnd(lnd()))]).await;
+        let mut o = row_opts(false, 1);
+        o.company_id = None;
+        assert!(
+            import_providers(&db, &FakeAdmin::default(), &Files, &o)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
@@ -671,6 +888,7 @@ mod tests {
             tenant: 7,
             apply: false,
             company_id: Some(2),
+            gateway_row: None,
         };
         let report = import_providers(&db, &FakeAdmin::default(), &Files, &only_two)
             .await

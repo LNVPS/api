@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use config::{Config, File};
 use lnvps_api::gateway_import::{
-    CONFIRM_ENV, FsCredentials, HttpGatewayAdmin, ImportOptions, confirm_apply, import_providers,
-    render_report,
+    CONFIRM_ENV, FsCredentials, GatewayRowSpec, HttpGatewayAdmin, ImportOptions, confirm_apply,
+    import_providers, next_steps, render_report,
 };
 use lnvps_api::settings::Settings;
 use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbMysql};
@@ -30,6 +30,15 @@ struct Args {
 
     #[clap(long)]
     apply: bool,
+
+    #[clap(long)]
+    create_gateway_row: bool,
+
+    #[clap(long)]
+    gateway_api_key: Option<String>,
+
+    #[clap(long)]
+    webhook_secret: Option<String>,
 }
 
 #[tokio::main]
@@ -73,6 +82,25 @@ async fn main() -> Result<()> {
         .context("pass --gateway-url or set the gateway section in the config")?;
 
     let db: Arc<dyn LNVpsDb> = Arc::new(LNVpsDbMysql::new(&settings.db).await?);
+    let gateway_row = if args.create_gateway_row {
+        let api_key = args
+            .gateway_api_key
+            .clone()
+            .or_else(|| std::env::var("GATEWAY_API_KEY").ok())
+            .context("pass --gateway-api-key or set GATEWAY_API_KEY")?;
+        let webhook_secret = args
+            .webhook_secret
+            .clone()
+            .or_else(|| std::env::var("GATEWAY_WEBHOOK_SECRET").ok())
+            .context("pass --webhook-secret or set GATEWAY_WEBHOOK_SECRET")?;
+        Some(GatewayRowSpec {
+            url: gateway_url.clone(),
+            api_key,
+            webhook_secret,
+        })
+    } else {
+        None
+    };
     let admin = HttpGatewayAdmin::new(&gateway_url, &admin_token);
     let report = import_providers(
         &db,
@@ -82,10 +110,14 @@ async fn main() -> Result<()> {
             tenant: args.tenant,
             apply: args.apply,
             company_id: args.company_id,
+            gateway_row,
         },
     )
     .await?;
     print!("{}", render_report(&report));
+    if args.apply {
+        print!("{}", next_steps(&report, &gateway_url));
+    }
     if !args.apply {
         println!("Nothing was changed. Re-run with --apply to create the providers.");
     }
