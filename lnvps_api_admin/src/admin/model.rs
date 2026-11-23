@@ -5139,7 +5139,7 @@ pub struct PartialGatewayConfig {
     pub webhook_secret: Option<String>,
     pub tolerance_seconds: Option<i64>,
     pub off_session_renewals: Option<lnvps_db::GatewayOffSession>,
-    pub handles: Option<Vec<lnvps_db::PaymentMethod>>,
+    pub handles: Option<Vec<String>>,
 }
 
 /// Partial provider configuration for updates - only provided fields will be updated
@@ -5267,7 +5267,13 @@ impl PartialProviderConfig {
                     off_session_renewals: partial
                         .off_session_renewals
                         .unwrap_or(existing.off_session_renewals),
-                    handles: partial.handles.unwrap_or_else(|| existing.handles.clone()),
+                    handles: match partial.handles {
+                        Some(list) => list
+                            .iter()
+                            .map(|s| s.to_lowercase().parse::<lnvps_db::PaymentMethod>())
+                            .collect::<Result<Vec<_>, _>>()?,
+                        None => existing.handles.clone(),
+                    },
                 }))
             }
             _ => Err(anyhow!(

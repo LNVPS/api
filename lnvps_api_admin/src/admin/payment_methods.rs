@@ -558,4 +558,218 @@ mod tests {
         assert!(res.is_ok());
         assert!(db.get_payment_method_config(id).await.unwrap().enabled);
     }
+
+    fn gateway_request(company: u64, enabled: bool) -> CreatePaymentMethodConfigRequest {
+        CreatePaymentMethodConfigRequest {
+            company_id: company,
+            name: "Gateway".to_string(),
+            enabled: Some(enabled),
+            config: ProviderConfig::Gateway(lnvps_db::GatewayProviderConfig {
+                url: "https://pay.example".to_string(),
+                api_key: "super-secret-key".to_string(),
+                webhook_secret: "super-secret-hook".to_string(),
+                tolerance_seconds: 300,
+                off_session_renewals: lnvps_db::GatewayOffSession::Off,
+                handles: vec![PaymentMethod::Lightning],
+            }),
+            processing_fee_rate: None,
+            processing_fee_base: None,
+            processing_fee_currency: None,
+            min_amount: None,
+            min_amount_currency: None,
+            supported_currencies: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_secrets_are_masked_in_the_admin_response() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let res =
+            admin_create_payment_method(auth(), State(state(&db)), Json(gateway_request(1, true)))
+                .await
+                .unwrap();
+        let json = serde_json::to_string(&res.0).unwrap();
+
+        assert!(!json.contains("super-secret-key"));
+        assert!(!json.contains("super-secret-hook"));
+        assert!(json.contains("\"has_api_key\":true"));
+        assert!(json.contains("\"has_webhook_secret\":true"));
+        assert!(json.contains("\"type\":\"gateway\""));
+
+        let id = res.0.data.id;
+        let got = admin_get_payment_method(auth(), State(state(&db)), Path(id))
+            .await
+            .unwrap();
+        let json = serde_json::to_string(&got.0).unwrap();
+        assert!(!json.contains("super-secret"));
+    }
+
+    #[tokio::test]
+    async fn a_second_enabled_gateway_row_for_a_company_is_refused() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        admin_create_payment_method(auth(), State(state(&db)), Json(gateway_request(1, true)))
+            .await
+            .unwrap();
+
+        let second =
+            admin_create_payment_method(auth(), State(state(&db)), Json(gateway_request(1, true)))
+                .await;
+
+        assert!(second.is_err());
+        let rows = db.list_payment_method_configs_for_company(1).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_gateway_row_is_allowed_when_disabled_or_for_another_company() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        admin_create_payment_method(auth(), State(state(&db)), Json(gateway_request(1, true)))
+            .await
+            .unwrap();
+
+        assert!(
+            admin_create_payment_method(auth(), State(state(&db)), Json(gateway_request(1, false)))
+                .await
+                .is_ok()
+        );
+        assert!(
+            admin_create_payment_method(auth(), State(state(&db)), Json(gateway_request(2, true)))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn enabling_a_second_gateway_row_is_refused() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        admin_create_payment_method(auth(), State(state(&db)), Json(gateway_request(1, true)))
+            .await
+            .unwrap();
+        let spare =
+            admin_create_payment_method(auth(), State(state(&db)), Json(gateway_request(1, false)))
+                .await
+                .unwrap()
+                .0
+                .data
+                .id;
+        let enable = UpdatePaymentMethodConfigRequest {
+            name: None,
+            enabled: Some(true),
+            config: None,
+            processing_fee_rate: None,
+            processing_fee_base: None,
+            processing_fee_currency: None,
+            min_amount: None,
+            min_amount_currency: None,
+            supported_currencies: None,
+        };
+
+        let res =
+            admin_update_payment_method(auth(), State(state(&db)), Path(spare), Json(enable)).await;
+
+        assert!(res.is_err());
+        assert!(!db.get_payment_method_config(spare).await.unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn gateway_handles_outside_the_supported_set_are_refused() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let mut req = gateway_request(1, false);
+        if let ProviderConfig::Gateway(g) = &mut req.config {
+            g.handles = vec![PaymentMethod::Paypal];
+        }
+
+        let res = admin_create_payment_method(auth(), State(state(&db)), Json(req)).await;
+
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn patching_a_gateway_row_keeps_its_secrets() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let id =
+            admin_create_payment_method(auth(), State(state(&db)), Json(gateway_request(1, false)))
+                .await
+                .unwrap()
+                .0
+                .data
+                .id;
+        let patch: UpdatePaymentMethodConfigRequest = serde_json::from_value(serde_json::json!({
+            "config": {"type": "gateway", "handles": ["lightning", "onchain"]}
+        }))
+        .unwrap();
+
+        admin_update_payment_method(auth(), State(state(&db)), Path(id), Json(patch))
+            .await
+            .unwrap();
+
+        let stored = db.get_payment_method_config(id).await.unwrap();
+        let gw = stored.get_provider_config().unwrap();
+        let gw = gw.as_gateway().unwrap();
+        assert_eq!(gw.api_key, "super-secret-key");
+        assert_eq!(
+            gw.handles,
+            vec![PaymentMethod::Lightning, PaymentMethod::OnChain]
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_status_counts_only_this_companys_gateway_payments() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let id =
+            admin_create_payment_method(auth(), State(state(&db)), Json(gateway_request(1, true)))
+                .await
+                .unwrap()
+                .0
+                .data
+                .id;
+
+        let status = admin_gateway_status(auth(), State(state(&db)), Path(id))
+            .await
+            .unwrap()
+            .0
+            .data;
+
+        assert!(status.enabled);
+        assert_eq!(status.payments_last_24h, 0);
+        assert!(status.last_paid_webhook_at.is_none());
+        assert_eq!(status.handles.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn gateway_test_rejects_a_non_gateway_row() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let id = db
+            .insert_payment_method_config(&onchain(true))
+            .await
+            .unwrap();
+
+        let res = admin_test_gateway(auth(), State(state(&db)), Path(id)).await;
+
+        assert!(res.is_err());
+    }
+
+    #[tokio::test]
+    async fn gateway_test_reports_an_unreachable_gateway_clearly() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let mut req = gateway_request(1, false);
+        if let ProviderConfig::Gateway(g) = &mut req.config {
+            g.url = "http://127.0.0.1:1".to_string();
+        }
+        let id = admin_create_payment_method(auth(), State(state(&db)), Json(req))
+            .await
+            .unwrap()
+            .0
+            .data
+            .id;
+
+        let res = admin_test_gateway(auth(), State(state(&db)), Path(id))
+            .await
+            .unwrap()
+            .0
+            .data;
+
+        assert!(!res.ok);
+        assert!(res.message.starts_with("Could not reach the gateway"));
+    }
 }

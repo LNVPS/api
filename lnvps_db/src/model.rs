@@ -4630,6 +4630,32 @@ mod tests {
     }
 
     #[test]
+    fn gateway_provider_config_round_trips_with_defaults() {
+        let json = serde_json::json!({
+            "type": "gateway",
+            "url": "https://pay.example",
+            "api_key": "k",
+            "webhook_secret": "s",
+            "handles": ["lightning", "OnChain"]
+        });
+        let cfg: ProviderConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.provider_type(), "gateway");
+        assert_eq!(cfg.payment_method(), PaymentMethod::Gateway);
+        let gw = cfg.as_gateway().unwrap();
+        assert_eq!(gw.tolerance_seconds, 300);
+        assert_eq!(gw.off_session_renewals, GatewayOffSession::Off);
+        assert!(gw.handles_method(PaymentMethod::OnChain));
+        assert!(!gw.handles_method(PaymentMethod::Stripe));
+        let back = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(back["handles"], serde_json::json!(["lightning", "onchain"]));
+        let bad = serde_json::json!({
+            "type": "gateway", "url": "u", "api_key": "k",
+            "webhook_secret": "s", "handles": ["bogus"]
+        });
+        assert!(serde_json::from_value::<ProviderConfig>(bad).is_err());
+    }
+
+    #[test]
     fn test_provider_config_onchain() {
         let config = ProviderConfig::OnChain(OnChainProviderConfig {
             url: "https://localhost:10009".to_string(),
@@ -4990,8 +5016,29 @@ pub struct GatewayProviderConfig {
     pub tolerance_seconds: i64,
     #[serde(default)]
     pub off_session_renewals: GatewayOffSession,
-    #[serde(default)]
+    #[serde(default, with = "handles_serde")]
     pub handles: Vec<PaymentMethod>,
+}
+
+mod handles_serde {
+    use super::PaymentMethod;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error, ser::SerializeSeq};
+    use std::str::FromStr;
+
+    pub fn serialize<S: Serializer>(v: &[PaymentMethod], s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(v.len()))?;
+        for m in v {
+            seq.serialize_element(&m.to_string().to_lowercase())?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<PaymentMethod>, D::Error> {
+        Vec::<String>::deserialize(d)?
+            .iter()
+            .map(|s| PaymentMethod::from_str(&s.to_lowercase()).map_err(D::Error::custom))
+            .collect()
+    }
 }
 
 fn default_gateway_tolerance() -> i64 {
