@@ -86,6 +86,25 @@ impl Display for ExecMode {
     }
 }
 
+async fn log_gateway_source(db: &Arc<dyn lnvps_db::LNVpsDb>, yaml: bool) {
+    let rows = db
+        .list_payment_method_configs()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|c| c.provider_type == "gateway")
+        .count();
+    if rows > 0 {
+        info!(
+            "Payment gateway source: payment_method_config rows ({rows}), the YAML gateway section is ignored"
+        );
+    } else if yaml {
+        info!("Payment gateway source: YAML gateway section (legacy)");
+    } else {
+        info!("Payment gateway source: none, payments are created in process");
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     env_logger::init();
@@ -310,6 +329,48 @@ async fn main() -> Result<(), Error> {
         work_commander.clone(),
         status.clone(),
     )?;
+    let sub_handler = match settings.gateway.as_ref().filter(|g| g.handles("lightning")) {
+        Some(g) => {
+            info!("Lightning invoices are created through the payment gateway");
+            sub_handler.with_lightning_gateway(Arc::new(lnvps_api_common::GatewayClient::new(g)))
+        }
+        None => sub_handler,
+    };
+    let sub_handler = match settings.gateway.as_ref().filter(|g| g.handles("onchain")) {
+        Some(g) => {
+            info!("On-chain addresses are created through the payment gateway");
+            sub_handler.with_onchain_gateway(Arc::new(lnvps_api_common::GatewayClient::new(g)))
+        }
+        None => sub_handler,
+    };
+    let sub_handler = match settings
+        .gateway
+        .as_ref()
+        .filter(|g| g.handles("fixedfloat"))
+    {
+        Some(g) => {
+            info!("FixedFloat swaps are created through the payment gateway");
+            sub_handler.with_swap_gateway(Arc::new(lnvps_api_common::GatewayClient::new(g)))
+        }
+        None => sub_handler,
+    };
+    let sub_handler = match settings
+        .gateway
+        .as_ref()
+        .filter(|g| g.handles("stripe") || g.handles("revolut"))
+    {
+        Some(g) => {
+            info!(
+                "Saved card methods use the payment gateway (off-session renewals: {:?})",
+                g.off_session_renewals
+            );
+            sub_handler
+                .with_card_gateway(Arc::new(lnvps_api_common::GatewayClient::new(g)))
+                .with_off_session_renewals(g.off_session_renewals)
+        }
+        None => sub_handler,
+    };
+    log_gateway_source(&db, settings.gateway.is_some()).await;
     sub_handler.vm_provisioner().init().await?;
 
     // On-chain provider for the worker's automated on-chain referral payouts.

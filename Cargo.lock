@@ -3551,6 +3551,7 @@ dependencies = [
  "nostr 0.44.7",
  "nostr-sdk",
  "payments-rs",
+ "regex",
  "reqwest 0.13.4",
  "rustls",
  "serde",
@@ -3596,6 +3597,7 @@ dependencies = [
  "nwc",
  "openapi-build-gen",
  "p256 0.13.2",
+ "payment-gateway-client",
  "payments-rs",
  "quick-xml",
  "rand 0.9.4",
@@ -3672,6 +3674,7 @@ dependencies = [
  "log 0.4.32",
  "maxminddb",
  "nostr 0.44.7",
+ "payment-gateway-client",
  "payments-rs",
  "quick-xml",
  "rand 0.10.1",
@@ -4772,6 +4775,21 @@ name = "pathdiff"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
+
+[[package]]
+name = "payment-gateway-client"
+version = "0.1.0"
+source = "git+https://github.com/v0l/payment-gateway?rev=7d9f8054638ec686be4f08756e8739ccd908bee8#7d9f8054638ec686be4f08756e8739ccd908bee8"
+dependencies = [
+ "hex",
+ "hmac 0.12.1",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "subtle",
+ "tokio",
+]
 
 [[package]]
 name = "payments-rs"

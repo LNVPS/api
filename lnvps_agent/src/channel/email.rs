@@ -437,7 +437,7 @@ fn extract_email_addr(raw: &str) -> Option<String> {
 }
 
 /// Parse "host:port" into (host, port).
-fn parse_host_port(s: &str, default_port: u16) -> Result<(String, u16)> {
+pub(crate) fn parse_host_port(s: &str, default_port: u16) -> Result<(String, u16)> {
     if let Some(pos) = s.rfind(':') {
         let port: u16 = s[pos + 1..]
             .parse()

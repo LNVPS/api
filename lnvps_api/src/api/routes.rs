@@ -22,9 +22,10 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use lnvps_api_common::{
-    AccountAction, ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate,
-    ClientInfo, ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, SnapshotAction,
-    TraderDetails, UpgradeConfig, UserRateLimiter, VatClient, WorkJob, apply_custom_pricing_limits, enforce_account_limit,
+    AccountAction, ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage,
+    ApiVmTemplate, ClientInfo, ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery,
+    SnapshotAction, TraderDetails, UpgradeConfig, UserRateLimiter, VatClient, WorkJob,
+    apply_custom_pricing_limits, enforce_account_limit,
 };
 use lnvps_db::{
     CpuArch, LNVpsDb, PaymentMethod, Region, Vm, VmCustomPricing, VmCustomPricingDisk,
@@ -237,14 +238,15 @@ async fn capture_client_geo(this: &RouterState, uid: u64, client_ip: ClientIp) {
     }
 }
 
-async fn flag_suspicious_order(this: &RouterState, user: &lnvps_db::User, vm_id: u64, cpu: u16, memory: u64) {
-    let signals = lnvps_api_common::order_signals(
-        user.created,
-        Utc::now(),
-        cpu,
-        memory,
-        user.email.as_str(),
-    );
+async fn flag_suspicious_order(
+    this: &RouterState,
+    user: &lnvps_db::User,
+    vm_id: u64,
+    cpu: u16,
+    memory: u64,
+) {
+    let signals =
+        lnvps_api_common::order_signals(user.created, Utc::now(), cpu, memory, user.email.as_str());
     if !lnvps_api_common::should_alert(&signals) {
         return;
     }
@@ -726,6 +728,7 @@ async fn v1_add_nwc_payment_method(
             .filter(|n| !n.is_empty()),
         external_customer_id: None,
         external_id: nwc.into(),
+        gateway_method_id: None,
         card_brand: None,
         card_last_four: None,
         exp_month: None,
@@ -789,6 +792,17 @@ async fn v1_delete_payment_method(
     let method = this.db.get_user_payment_method(id).await?;
     if method.user_id != uid {
         return ApiData::err("Payment method not found");
+    }
+    if let Some(gateway_id) = method.gateway_method_id {
+        let gateway = match this.sub_handler.card_gateway().await {
+            Ok(Some(g)) => g,
+            Ok(None) => return ApiData::err("Payment gateway is not configured"),
+            Err(e) => return Err(ApiError::internal(e)),
+        };
+        gateway
+            .delete_saved_method(gateway_id)
+            .await
+            .map_err(ApiError::internal)?;
     }
     this.db.delete_user_payment_method(id).await?;
     ApiData::ok(())
@@ -2333,7 +2347,7 @@ fn build_payment_methods_response(
 
     let mut ret: Vec<ApiPaymentInfo> = configs
         .into_iter()
-        .filter(|c| c.enabled)
+        .filter(|c| c.enabled && c.payment_method != PaymentMethod::Gateway)
         .map(|config| {
             // Use supported_currencies from DB if set, otherwise fall back to defaults
             let currencies = if config.supported_currencies.is_empty() {
@@ -2405,6 +2419,7 @@ fn default_currencies_for_method(method: PaymentMethod) -> Vec<ApiCurrency> {
         PaymentMethod::Revolut => vec![ApiCurrency::EUR, ApiCurrency::USD],
         PaymentMethod::Paypal => vec![ApiCurrency::EUR, ApiCurrency::USD],
         PaymentMethod::Stripe => vec![ApiCurrency::EUR, ApiCurrency::USD],
+        PaymentMethod::Gateway => vec![],
     }
 }
 
@@ -4110,6 +4125,97 @@ mod tests {
             &base64::engine::general_purpose::STANDARD.encode(nostr::JsonUtil::as_json(&event)),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn deleting_a_gateway_saved_method_removes_it_at_the_gateway_first() {
+        use lnvps_api_common::{FakeGateway, MockDb};
+        let db = Arc::new(MockDb::default());
+        let fake = Arc::new(FakeGateway::default());
+        let mut state = mock_router_state(db.clone()).await;
+        state.sub_handler = state.sub_handler.with_card_gateway(fake.clone());
+        let auth = nostr_auth(11);
+        let uid = db.upsert_user(&auth.pubkey()).await.unwrap();
+        let id = db
+            .insert_user_payment_method(&gateway_card(uid, 55))
+            .await
+            .unwrap();
+
+        *fake.fail.lock().unwrap() = true;
+        assert!(
+            v1_delete_payment_method(nostr_auth(11), State(state.clone()), Path(id))
+                .await
+                .is_err()
+        );
+        assert!(db.get_user_payment_method(id).await.is_ok());
+
+        *fake.fail.lock().unwrap() = false;
+        v1_delete_payment_method(nostr_auth(11), State(state.clone()), Path(id))
+            .await
+            .unwrap();
+        assert!(db.get_user_payment_method(id).await.is_err());
+        assert_eq!(*fake.deleted_methods.lock().unwrap(), vec![55]);
+    }
+
+    #[tokio::test]
+    async fn another_user_cannot_delete_or_list_a_gateway_saved_method() {
+        use lnvps_api_common::{FakeGateway, MockDb};
+        let db = Arc::new(MockDb::default());
+        let fake = Arc::new(FakeGateway::default());
+        let mut state = mock_router_state(db.clone()).await;
+        state.sub_handler = state.sub_handler.with_card_gateway(fake.clone());
+        let owner = db.upsert_user(&nostr_auth(11).pubkey()).await.unwrap();
+        let id = db
+            .insert_user_payment_method(&gateway_card(owner, 55))
+            .await
+            .unwrap();
+
+        let other = nostr_auth(12);
+        let _ = v1_delete_payment_method(other, State(state.clone()), Path(id)).await;
+        assert!(db.get_user_payment_method(id).await.is_ok());
+        assert!(fake.deleted_methods.lock().unwrap().is_empty());
+
+        let listed = v1_list_payment_methods(nostr_auth(12), State(state.clone()))
+            .await
+            .unwrap();
+        let body = serde_json::to_string(&listed.0).unwrap();
+        assert!(!body.contains("pm_gw") && !body.contains("cus_gw"));
+        assert!(!body.contains(&format!("\"id\":{id}")));
+
+        let own = v1_list_payment_methods(nostr_auth(11), State(state))
+            .await
+            .unwrap();
+        let body = serde_json::to_string(&own.0).unwrap();
+        assert!(body.contains(&format!("\"id\":{id}")));
+        assert!(!body.contains("pm_gw") && !body.contains("cus_gw"));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_gateway_method_without_a_gateway_is_refused() {
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        let uid = db.upsert_user(&nostr_auth(11).pubkey()).await.unwrap();
+        let id = db
+            .insert_user_payment_method(&gateway_card(uid, 55))
+            .await
+            .unwrap();
+        let r = v1_delete_payment_method(nostr_auth(11), State(state), Path(id)).await;
+        assert!(r.is_err());
+        assert!(db.get_user_payment_method(id).await.is_ok());
+    }
+
+    fn gateway_card(user_id: u64, gateway_method_id: u64) -> lnvps_db::UserPaymentMethod {
+        lnvps_db::UserPaymentMethod {
+            user_id,
+            provider: "stripe".into(),
+            external_customer_id: Some("cus_gw".to_string().into()),
+            external_id: "pm_gw".to_string().into(),
+            gateway_method_id: Some(gateway_method_id),
+            card_last_four: Some("4242".into()),
+            enabled: true,
+            ..Default::default()
+        }
     }
 
     const TEST_SSH_KEY: &str =

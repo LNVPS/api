@@ -4357,4 +4357,130 @@ config:
             Some("/usr/local/bin/ditto-policy")
         );
     }
+
+    fn strfry_catalog() -> Compose {
+        let yaml = catalog_documents()
+            .into_iter()
+            .find(|(n, _)| n == "strfry")
+            .unwrap()
+            .1;
+        Compose::parse(&yaml).unwrap()
+    }
+
+    fn strfry_vars(allowed: &str, plugin: &str) -> HashMap<String, String> {
+        let c = strfry_catalog();
+        let mut submitted = std::collections::BTreeMap::new();
+        submitted.insert(
+            "filter_validation_allowed_kinds".to_string(),
+            allowed.to_string(),
+        );
+        submitted.insert("write_policy_plugin".to_string(), plugin.to_string());
+        let mut vars: HashMap<String, String> = resolve_config(&c, &submitted)
+            .unwrap()
+            .into_iter()
+            .collect();
+        vars.insert("HOSTNAME".into(), "h.example.com".into());
+        vars
+    }
+
+    fn run_strfry_policy(
+        allowed: &str,
+        plugin: &str,
+        events: &[serde_json::Value],
+    ) -> Vec<serde_json::Value> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let c = strfry_catalog();
+        let vars = strfry_vars(allowed, plugin);
+        let env = &c.resolve_env(&vars).unwrap()["strfry"];
+        let files = &c.resolve_files(&vars).unwrap()["strfry"];
+        let script = files
+            .iter()
+            .find(|f| f.path == "/etc/strfry-view-policy.py")
+            .unwrap();
+        let path = std::env::temp_dir().join(format!(
+            "strfry-policy-{}-{}.py",
+            std::process::id(),
+            allowed.len() + plugin.len() + events.len()
+        ));
+        std::fs::write(&path, &script.content).unwrap();
+        let mut child = Command::new("python3")
+            .arg(&path)
+            .env("ALLOWED_KINDS", &env["ALLOWED_KINDS"])
+            .env("VIEW_POLICY", &env["VIEW_POLICY"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        for e in events {
+            let msg = serde_json::json!({
+                "type": "new", "event": e, "sourceType": "IP4", "sourceInfo": "1.2.3.4"
+            });
+            writeln!(stdin, "{msg}").unwrap();
+        }
+        drop(stdin);
+        let out = child.wait_with_output().unwrap();
+        std::fs::remove_file(&path).ok();
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    fn kind_event(kind: u64) -> serde_json::Value {
+        serde_json::json!({
+            "id": "f".repeat(64), "pubkey": "b".repeat(64), "kind": kind,
+            "created_at": 1_700_000_000u64, "tags": [], "content": "", "sig": ""
+        })
+    }
+
+    #[test]
+    fn strfry_allowed_kinds_gate_writes_not_reads() {
+        let c = strfry_catalog();
+        let vars = strfry_vars("1, 7", "");
+        let conf = &c.resolve_files(&vars).unwrap()["strfry"]
+            .iter()
+            .find(|f| f.path == "/etc/strfry.conf")
+            .unwrap()
+            .content
+            .clone();
+        assert!(conf.contains("allowedKinds = \"\""), "{conf}");
+        assert!(conf.contains("plugin = \"python3 /etc/strfry-view-policy.py\""));
+        assert_eq!(
+            c.resolve_env(&vars).unwrap()["strfry"]["ALLOWED_KINDS"],
+            "1, 7"
+        );
+        let field = c
+            .config
+            .iter()
+            .find(|f| f.name == "filter_validation_allowed_kinds")
+            .unwrap();
+        assert!(field.label.as_deref().unwrap().contains("publish"));
+    }
+
+    #[test]
+    fn strfry_policy_rejects_kinds_off_the_list() {
+        let out = run_strfry_policy("1, 7", "", &[kind_event(1), kind_event(1059)]);
+        assert_eq!(out[0]["action"], "accept");
+        assert_eq!(out[1]["action"], "reject");
+        assert_eq!(out[1]["msg"], "blocked: kind 1059 not accepted here");
+    }
+
+    #[test]
+    fn strfry_policy_blank_list_accepts_everything() {
+        let out = run_strfry_policy("", "", &[kind_event(1059), kind_event(1)]);
+        assert!(out.iter().all(|v| v["action"] == "accept"));
+    }
+
+    #[test]
+    fn strfry_policy_still_checks_work_on_views() {
+        let plugin = "python3 /etc/strfry-view-policy.py";
+        let out = run_strfry_policy("1, 7700", plugin, &[kind_event(7700)]);
+        assert_eq!(out[0]["action"], "reject");
+        assert!(out[0]["msg"].as_str().unwrap().starts_with("invalid"));
+        let out = run_strfry_policy("1", plugin, &[kind_event(7700)]);
+        assert_eq!(out[0]["msg"], "blocked: kind 7700 not accepted here");
+    }
 }

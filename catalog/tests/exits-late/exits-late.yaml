@@ -1,0 +1,7 @@
+services:
+  app:
+    image: lnvps-test-exits-late:local
+    user: "1000"
+    resources: { cpu: 100m, memory: 64Mi }
+    ports:
+      - { name: web, container: 8080, protocol: http, expose: ingress }

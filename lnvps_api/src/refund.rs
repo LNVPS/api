@@ -16,8 +16,8 @@ use anyhow::{Result, anyhow, bail, ensure};
 use chrono::{DateTime, Utc};
 use lightning_invoice::Bolt11Invoice;
 use lnvps_api_common::{
-    PricingEngine, RefundEvidence, VmHistoryLogger, build_refund_row, refundable_remaining,
-    value_in_billing_currency,
+    PaymentGateway, PricingEngine, RefundEvidence, VmHistoryLogger, build_refund_row,
+    refundable_remaining, value_in_billing_currency,
 };
 use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment};
 use log::{error, info};
@@ -25,6 +25,8 @@ use payments_rs::currency::{Currency, CurrencyAmount};
 use payments_rs::lightning::{LightningNode, PayInvoiceRequest};
 use std::str::FromStr;
 use std::sync::Arc;
+
+mod gateway;
 
 /// How long to wait for the payout to settle before giving up on it.
 const PAYOUT_TIMEOUT_SECONDS: u32 = 60;
@@ -159,6 +161,8 @@ pub struct VmRefundHandler {
     node: Arc<dyn LightningNode>,
     pricing: PricingEngine,
     history: VmHistoryLogger,
+    gateway: Option<Arc<dyn PaymentGateway>>,
+    directory: Option<lnvps_api_common::GatewayDirectory>,
 }
 
 impl VmRefundHandler {
@@ -169,6 +173,8 @@ impl VmRefundHandler {
             node,
             pricing,
             history,
+            gateway: None,
+            directory: None,
         }
     }
 
@@ -708,7 +714,7 @@ pub fn paid_through(payments: &[SubscriptionPayment]) -> Option<DateTime<Utc>> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use anyhow::anyhow;
     use async_trait::async_trait;
@@ -726,8 +732,8 @@ mod tests {
     /// A node that records what it was asked to pay and can be told to fail,
     /// so a test can tell "refused before paying" from "paid then failed".
     #[derive(Default)]
-    struct PayNode {
-        paid: Mutex<Vec<String>>,
+    pub(super) struct PayNode {
+        pub(super) paid: Mutex<Vec<String>>,
         fail: bool,
     }
 
@@ -768,7 +774,7 @@ mod tests {
 
     /// A signed regtest invoice for `msat`, so the amount and expiry checks
     /// run against a real BOLT11 rather than a fixture string.
-    fn invoice_for(msat: u64) -> String {
+    pub(super) fn invoice_for(msat: u64) -> String {
         const NODE_KEY: [u8; 32] = [0xcd; 32];
         let secret: [u8; 32] = [7u8; 32];
         InvoiceBuilder::new(Currency::Regtest)
@@ -788,7 +794,7 @@ mod tests {
     }
 
     /// A handler at a fixed 100,000 EUR/BTC, so €1 is exactly 1,000,000 msat.
-    async fn handler(db: Arc<dyn LNVpsDb>, node: Arc<PayNode>) -> VmRefundHandler {
+    pub(super) async fn handler(db: Arc<dyn LNVpsDb>, node: Arc<PayNode>) -> VmRefundHandler {
         let rates = Arc::new(MockExchangeRate::new());
         rates
             .set_rate(
@@ -805,7 +811,11 @@ mod tests {
 
     /// A VM with 15 days left on its subscription and one paid renewal of
     /// `amount` cents behind it.
-    async fn vm_with_payment(db: &MockDb, amount: u64, tax: u64) -> (Vm, SubscriptionPayment) {
+    pub(super) async fn vm_with_payment(
+        db: &MockDb,
+        amount: u64,
+        tax: u64,
+    ) -> (Vm, SubscriptionPayment) {
         let user_id = db.upsert_user(&[0u8; 32]).await.unwrap();
         db.user_ssh_keys.lock().await.insert(
             1,

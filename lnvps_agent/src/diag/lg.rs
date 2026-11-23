@@ -69,7 +69,16 @@ pub struct Traceroute {
     pub rtt_ms: Option<f32>,
     /// Full path, so the model can point at where a path dies.
     pub hops: Vec<Hop>,
+    /// `no_reply_from_vm` when the looking glass answered but the report held
+    /// no hop at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meaning: Option<&'static str>,
 }
+
+pub const NO_REPLY_FROM_VM: &str = "no_reply_from_vm";
+pub const NO_REPLY_MEANING: &str = "The edge router got no reply from this VM on its local network. The looking glass itself is working. The VM is off, its network is down, or its firewall drops everything.";
 
 /// Client for the public looking glass.
 #[derive(Debug, Clone)]
@@ -119,11 +128,14 @@ impl LookingGlass {
             .get(&url)
             .send()
             .await
-            .context("looking glass request failed")?;
+            .context("looking glass unavailable: request failed")?;
         if !response.status().is_success() {
-            bail!("looking glass returned {}", response.status());
+            bail!("looking glass unavailable: returned {}", response.status());
         }
-        let body = response.text().await.context("looking glass read failed")?;
+        let body = response
+            .text()
+            .await
+            .context("looking glass unavailable: read failed")?;
         parse_mtr(&strip_html(&body), target, &self.server)
     }
 }
@@ -160,8 +172,20 @@ fn strip_html(html: &str) -> String {
 fn parse_mtr(text: &str, target: IpAddr, server: &str) -> Result<Traceroute> {
     let hops: Vec<Hop> = text.lines().filter_map(parse_hop).collect();
     if hops.is_empty() {
+        if text.lines().any(|l| l.trim_start().starts_with("HOST:")) {
+            return Ok(Traceroute {
+                target: target.to_string(),
+                from: server.to_string(),
+                reached: false,
+                loss_percent: None,
+                rtt_ms: None,
+                hops,
+                status: Some(NO_REPLY_FROM_VM),
+                meaning: Some(NO_REPLY_MEANING),
+            });
+        }
         bail!(
-            "looking glass returned no traceroute output for {} — the probe tool on the edge may be unavailable",
+            "looking glass unavailable: no traceroute report for {} in its answer",
             target
         );
     }
@@ -175,6 +199,8 @@ fn parse_mtr(text: &str, target: IpAddr, server: &str) -> Result<Traceroute> {
         loss_percent: final_hop.map(|h| h.loss_percent),
         rtt_ms: final_hop.filter(|h| h.responded()).and_then(|h| h.rtt_ms),
         hops,
+        status: None,
+        meaning: None,
     })
 }
 
@@ -250,6 +276,44 @@ HOST: router        Loss%   Snt   Last   Avg  Best  Wrst StDev
         let tr = parse_mtr(report, target(), "edge1").unwrap();
         assert!(!tr.reached);
         assert_eq!(tr.rtt_ms, None);
+    }
+
+    const HEADER_ONLY_PAGE: &str = "<div class=\"container\">\n\t<h2>edge1: 185.18.221.221</h2>\n<pre>Start: 2026-11-19T16:37:07+0000\nHOST: router Loss%   Snt   Last   Avg  Best  Wrst StDev\n</pre>\n\n</div>";
+
+    #[test]
+    fn header_only_report_is_no_reply_from_vm() {
+        let tr = parse_mtr(&strip_html(HEADER_ONLY_PAGE), target(), "edge1").unwrap();
+        assert_eq!(tr.status, Some("no_reply_from_vm"));
+        assert!(tr.meaning.unwrap().contains("no reply from this VM"));
+        assert!(!tr.reached);
+        assert!(tr.hops.is_empty());
+    }
+
+    #[tokio::test]
+    async fn header_only_answer_is_not_an_unavailable_looking_glass() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(HEADER_ONLY_PAGE))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let lg = LookingGlass::new(server.uri(), "edge1");
+        let tr = lg.traceroute(target()).await.unwrap();
+        assert_eq!(tr.status, Some(NO_REPLY_FROM_VM));
+    }
+
+    #[tokio::test]
+    async fn http_failure_is_the_only_unavailable_case() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(wiremock::ResponseTemplate::new(502))
+            .mount(&server)
+            .await;
+        let err = LookingGlass::new(server.uri(), "edge1")
+            .traceroute(target())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("looking glass unavailable"));
     }
 
     #[test]

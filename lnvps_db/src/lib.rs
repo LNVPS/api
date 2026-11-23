@@ -954,6 +954,15 @@ pub trait LNVpsDbBase: Send + Sync {
         compacted_upto: u64,
     ) -> DbResult<()>;
 
+    /// Record that the agent emailed a conversation to support: stamps the
+    /// time, bumps the counter and keeps the latest reason and VM ids.
+    async fn record_agent_escalation(
+        &self,
+        conversation_id: u64,
+        reason: &str,
+        vm_ids: &str,
+    ) -> DbResult<()>;
+
     /// Execute a raw SQL query that doesn't return data
     async fn execute_query(&self, query: &str) -> DbResult<u64>;
 
@@ -1151,7 +1160,16 @@ pub trait LNVpsDbBase: Send + Sync {
         payment_id: &Vec<u8>,
     ) -> DbResult<Vec<SubscriptionPayment>>;
     async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()>;
+    async fn list_expired_unpaid_gateway_payments(
+        &self,
+        now: DateTime<Utc>,
+    ) -> DbResult<Vec<SubscriptionPayment>>;
     async fn update_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()>;
+    async fn gateway_payment_stats(
+        &self,
+        company_id: u64,
+        since: DateTime<Utc>,
+    ) -> DbResult<(u64, Option<DateTime<Utc>>)>;
     async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> DbResult<()>;
     async fn last_paid_subscription_invoice(&self) -> DbResult<Option<SubscriptionPayment>>;
 

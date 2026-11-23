@@ -28,6 +28,20 @@ read-only: false
 max-prepay-days: 365
 ```
 
+Optional `gateway` section (legacy way to use the payment gateway, see
+[payment-gateway-migration.md](payment-gateway-migration.md)). Prefer a `gateway` payment method row per company, which an admin enables and disables without a config edit or deploy. A company with a gateway row ignores this section; companies without one still use it:
+
+```yaml
+gateway:
+  url: "https://pay.example.com"
+  api-key: "..."
+  webhook-secret: "..."
+  methods: ["lightning"]
+  off-session-renewals: off
+```
+
+`off-session-renewals` is `off` (default), `dry-run` or `live`. Saved cards held by the gateway (`user_payment_method.gateway_method_id` set) are only charged by the renewal job in `live` mode. `dry-run` logs the amount it would charge and charges nothing. Adding `stripe` or `revolut` to `methods` routes saved-card charges and saved-method deletion through the gateway; methods without a gateway id keep the in-process path.
+
 > **Payment providers** (Lightning node, on-chain wallet, Revolut) are **not**
 > configured here — they live in the `payment_method_config` DB table and are
 > managed via `POST`/`PATCH /api/admin/v1/payment_method_configs`.

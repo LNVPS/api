@@ -2806,6 +2806,10 @@ impl LNVpsDbBase for MockDb {
             compacted_upto: 0,
             created: now,
             updated: now,
+            escalated_at: None,
+            escalation_count: 0,
+            escalation_reason: None,
+            escalation_vm_ids: None,
         };
         conversations.insert(id, conversation.clone());
         Ok(conversation)
@@ -2840,6 +2844,10 @@ impl LNVpsDbBase for MockDb {
             updated: conversation.updated,
             message_count: own.len() as u64,
             last_message_at: own.iter().map(|m| m.created).max(),
+            escalated_at: conversation.escalated_at,
+            escalation_count: conversation.escalation_count,
+            escalation_reason: conversation.escalation_reason,
+            escalation_vm_ids: conversation.escalation_vm_ids,
         })
     }
 
@@ -2879,6 +2887,10 @@ impl LNVpsDbBase for MockDb {
                     updated: c.updated,
                     message_count: own.len() as u64,
                     last_message_at: own.iter().map(|m| m.created).max(),
+                    escalated_at: c.escalated_at,
+                    escalation_count: c.escalation_count,
+                    escalation_reason: c.escalation_reason.clone(),
+                    escalation_vm_ids: c.escalation_vm_ids.clone(),
                 }
             })
             .collect();
@@ -2894,6 +2906,23 @@ impl LNVpsDbBase for MockDb {
                 .collect(),
             total,
         ))
+    }
+
+    async fn record_agent_escalation(
+        &self,
+        conversation_id: u64,
+        reason: &str,
+        vm_ids: &str,
+    ) -> DbResult<()> {
+        let mut conversations = self.agent_conversations.lock().await;
+        let conversation = conversations.get_mut(&conversation_id).ok_or_else(|| {
+            DbError::from(anyhow!("agent conversation {} not found", conversation_id))
+        })?;
+        conversation.escalated_at = Some(chrono::Utc::now());
+        conversation.escalation_count += 1;
+        conversation.escalation_reason = Some(reason.to_string());
+        conversation.escalation_vm_ids = Some(vm_ids.to_string());
+        Ok(())
     }
 
     async fn count_agent_messages(&self, conversation_id: u64) -> DbResult<u64> {
@@ -3632,6 +3661,52 @@ impl LNVpsDbBase for MockDb {
             .filter(|p| p.payment_method == method)
             .cloned()
             .collect())
+    }
+
+    async fn list_expired_unpaid_gateway_payments(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        let payments = self.subscription_payments.lock().await;
+        Ok(payments
+            .iter()
+            .filter(|p| {
+                !p.is_paid
+                    && p.expires < now
+                    && p.payment_type != lnvps_db::SubscriptionPaymentType::Refund
+                    && p.external_id
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with("pgw:"))
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn gateway_payment_stats(
+        &self,
+        company_id: u64,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> DbResult<(u64, Option<chrono::DateTime<chrono::Utc>>)> {
+        let subs = self.subscriptions.lock().await;
+        let payments = self.subscription_payments.lock().await;
+        let mine: Vec<_> = payments
+            .iter()
+            .filter(|p| {
+                p.external_id
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("pgw:"))
+                    && subs
+                        .get(&p.subscription_id)
+                        .is_some_and(|s| s.company_id == company_id)
+            })
+            .collect();
+        let count = mine.iter().filter(|p| p.created >= since).count() as u64;
+        let last = mine
+            .iter()
+            .filter(|p| p.is_paid)
+            .filter_map(|p| p.paid_at)
+            .max();
+        Ok((count, last))
     }
 
     async fn get_subscription_payment_with_company(
@@ -10002,6 +10077,7 @@ mod tests {
             name: None,
             external_customer_id: Some("cust".to_string().into()),
             external_id: "pm".to_string().into(),
+            gateway_method_id: None,
             card_brand: Some("VISA".to_string()),
             card_last_four: Some("5709".to_string()),
             exp_month: Some(12),

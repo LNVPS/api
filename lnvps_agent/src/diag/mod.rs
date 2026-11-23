@@ -28,7 +28,7 @@ use serde::Serialize;
 use std::net::IpAddr;
 use std::sync::Arc;
 
-pub use lg::{Hop, LookingGlass, Traceroute};
+pub use lg::{Hop, LookingGlass, NO_REPLY_FROM_VM, Traceroute};
 pub use policy::PolicyDocs;
 pub use port::{COMMON_PORTS, MAX_SCAN_PORTS, PortCheck, PortScan, check_port, scan_ports};
 
@@ -56,6 +56,10 @@ pub struct Reachability {
     /// Where the path stopped answering, when the target did not reply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_responding_hop: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meaning: Option<&'static str>,
 }
 
 impl Diagnostics {
@@ -183,6 +187,8 @@ fn summarise(trace: Traceroute) -> Reachability {
         loss_percent: trace.loss_percent,
         rtt_ms: trace.rtt_ms,
         last_responding_hop,
+        status: trace.status,
+        meaning: trace.meaning,
     }
 }
 
@@ -286,6 +292,8 @@ mod tests {
                     rtt_ms: None,
                 },
             ],
+            status: None,
+            meaning: None,
         }
     }
 

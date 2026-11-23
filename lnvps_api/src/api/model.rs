@@ -626,7 +626,7 @@ impl ApiVmPayment {
                 PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data.into()),
                 PaymentMethod::OnChain => ApiPaymentData::OnChain {
                     address: value.external_data.into(),
-                    outpoint: value.external_id.clone(),
+                    outpoint: lnvps_api_common::deposit_outpoint(&value.external_id),
                 },
                 PaymentMethod::FixedFloat => {
                     let data = crate::swap::SwapData::parse(value.external_data.as_str()).map_err(
@@ -636,7 +636,7 @@ impl ApiVmPayment {
                         coin: data.coin,
                         address: data.deposit_address,
                         amount: data.deposit_amount,
-                        outpoint: value.external_id.clone(),
+                        outpoint: lnvps_api_common::deposit_outpoint(&value.external_id),
                     }
                 }
                 PaymentMethod::Revolut => {
@@ -651,6 +651,7 @@ impl ApiVmPayment {
                     ApiPaymentData::Revolut { token: data.token }
                 }
                 PaymentMethod::Paypal => anyhow::bail!("PayPal payments are not supported"),
+                PaymentMethod::Gateway => anyhow::bail!("Gateway is not a payment method"),
                 PaymentMethod::Stripe => {
                     #[derive(Deserialize)]
                     struct StripeData {
@@ -800,6 +801,7 @@ impl From<PaymentMethod> for ApiPaymentMethod {
             PaymentMethod::Stripe => ApiPaymentMethod::Stripe,
             PaymentMethod::OnChain => ApiPaymentMethod::OnChain,
             PaymentMethod::FixedFloat => ApiPaymentMethod::FixedFloat,
+            PaymentMethod::Gateway => ApiPaymentMethod::default(),
         }
     }
 }
@@ -1470,7 +1472,7 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
             }
             PaymentMethod::OnChain => ApiPaymentData::OnChain {
                 address: payment.external_data.clone().into(),
-                outpoint: payment.external_id.clone(),
+                outpoint: lnvps_api_common::deposit_outpoint(&payment.external_id),
             },
             PaymentMethod::FixedFloat => {
                 crate::swap::SwapData::parse(payment.external_data.as_str())
@@ -1478,7 +1480,7 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
                         coin: d.coin,
                         address: d.deposit_address,
                         amount: d.deposit_amount,
-                        outpoint: payment.external_id.clone(),
+                        outpoint: lnvps_api_common::deposit_outpoint(&payment.external_id),
                     })
                     .unwrap_or_else(|_| ApiPaymentData::Lightning(String::new()))
             }
@@ -1502,7 +1504,9 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
                     .unwrap_or_default();
                 ApiPaymentData::Stripe { session_id }
             }
-            PaymentMethod::Paypal => ApiPaymentData::Lightning(String::new()),
+            PaymentMethod::Paypal | PaymentMethod::Gateway => {
+                ApiPaymentData::Lightning(String::new())
+            }
         };
 
         Self {

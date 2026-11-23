@@ -1002,13 +1002,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_user_payment_method(&self, pm: &UserPaymentMethod) -> DbResult<u64> {
         Ok(sqlx::query(
-            "insert into user_payment_method(user_id,provider,name,external_customer_id,external_id,card_brand,card_last_four,exp_month,exp_year,is_default,enabled) values(?,?,?,?,?,?,?,?,?,?,?) returning id",
+            "insert into user_payment_method(user_id,provider,name,external_customer_id,external_id,gateway_method_id,card_brand,card_last_four,exp_month,exp_year,is_default,enabled) values(?,?,?,?,?,?,?,?,?,?,?,?) returning id",
         )
         .bind(pm.user_id)
         .bind(&pm.provider)
         .bind(&pm.name)
         .bind(&pm.external_customer_id)
         .bind(&pm.external_id)
+        .bind(pm.gateway_method_id)
         .bind(&pm.card_brand)
         .bind(&pm.card_last_four)
         .bind(pm.exp_month)
@@ -1090,9 +1091,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_user_payment_method(&self, pm: &UserPaymentMethod) -> DbResult<()> {
         sqlx::query(
-            "update user_payment_method set name=?,card_brand=?,card_last_four=?,exp_month=?,exp_year=?,is_default=?,enabled=? where id=?",
+            "update user_payment_method set name=?,gateway_method_id=?,card_brand=?,card_last_four=?,exp_month=?,exp_year=?,is_default=?,enabled=? where id=?",
         )
         .bind(&pm.name)
+        .bind(pm.gateway_method_id)
         .bind(&pm.card_brand)
         .bind(&pm.card_last_four)
         .bind(pm.exp_month)
@@ -3804,6 +3806,28 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn record_agent_escalation(
+        &self,
+        conversation_id: u64,
+        reason: &str,
+        vm_ids: &str,
+    ) -> DbResult<()> {
+        sqlx::query(
+            r#"update agent_conversation
+                  set escalated_at=current_timestamp,
+                      escalation_count=escalation_count+1,
+                      escalation_reason=?,
+                      escalation_vm_ids=?
+                where id=?"#,
+        )
+        .bind(reason)
+        .bind(vm_ids)
+        .bind(conversation_id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
     async fn execute_query(&self, query: &str) -> DbResult<u64> {
         let result = sqlx::query(query).execute(&self.db).await?;
         Ok(result.rows_affected())
@@ -4573,6 +4597,40 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_all(&self.db)
                 .await?,
         )
+    }
+
+    async fn list_expired_unpaid_gateway_payments(
+        &self,
+        now: DateTime<Utc>,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM subscription_payment WHERE is_paid = 0 AND expires < ? AND external_id LIKE 'pgw:%' AND payment_type != ? ORDER BY expires LIMIT 500",
+        )
+        .bind(now)
+        .bind(crate::SubscriptionPaymentType::Refund)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn gateway_payment_stats(
+        &self,
+        company_id: u64,
+        since: DateTime<Utc>,
+    ) -> DbResult<(u64, Option<DateTime<Utc>>)> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM subscription_payment sp JOIN subscription s ON s.id = sp.subscription_id WHERE s.company_id = ? AND sp.external_id LIKE 'pgw:%' AND sp.created >= ?",
+        )
+        .bind(company_id)
+        .bind(since)
+        .fetch_one(&self.db)
+        .await?;
+        let last: Option<DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT MAX(sp.paid_at) FROM subscription_payment sp JOIN subscription s ON s.id = sp.subscription_id WHERE s.company_id = ? AND sp.external_id LIKE 'pgw:%' AND sp.is_paid = 1",
+        )
+        .bind(company_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok((count as u64, last))
     }
 
     async fn get_subscription_payment_with_company(

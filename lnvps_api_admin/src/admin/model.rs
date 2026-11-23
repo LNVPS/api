@@ -3529,6 +3529,7 @@ pub enum AdminPaymentMethod {
     OnChain,
     #[serde(rename = "fixedfloat")]
     FixedFloat,
+    Gateway,
     Credit,
 }
 
@@ -3551,6 +3552,7 @@ impl From<PaymentMethod> for AdminPaymentMethod {
             PaymentMethod::Stripe => AdminPaymentMethod::Stripe,
             PaymentMethod::OnChain => AdminPaymentMethod::OnChain,
             PaymentMethod::FixedFloat => AdminPaymentMethod::FixedFloat,
+            PaymentMethod::Gateway => AdminPaymentMethod::Gateway,
         }
     }
 }
@@ -4658,6 +4660,7 @@ pub enum AdminPaymentMethodType {
     Stripe,
     OnChain,
     FixedFloat,
+    Gateway,
 }
 
 impl From<lnvps_db::PaymentMethod> for AdminPaymentMethodType {
@@ -4669,6 +4672,7 @@ impl From<lnvps_db::PaymentMethod> for AdminPaymentMethodType {
             lnvps_db::PaymentMethod::Stripe => AdminPaymentMethodType::Stripe,
             lnvps_db::PaymentMethod::OnChain => AdminPaymentMethodType::OnChain,
             lnvps_db::PaymentMethod::FixedFloat => AdminPaymentMethodType::FixedFloat,
+            lnvps_db::PaymentMethod::Gateway => AdminPaymentMethodType::Gateway,
         }
     }
 }
@@ -4682,6 +4686,7 @@ impl From<AdminPaymentMethodType> for lnvps_db::PaymentMethod {
             AdminPaymentMethodType::Stripe => lnvps_db::PaymentMethod::Stripe,
             AdminPaymentMethodType::OnChain => lnvps_db::PaymentMethod::OnChain,
             AdminPaymentMethodType::FixedFloat => lnvps_db::PaymentMethod::FixedFloat,
+            AdminPaymentMethodType::Gateway => lnvps_db::PaymentMethod::Gateway,
         }
     }
 }
@@ -4749,10 +4754,22 @@ pub struct SanitizedPaypalConfig {
     pub has_client_secret: bool,
 }
 
+/// Sanitized gateway config (hides api_key and webhook_secret)
+#[derive(Serialize)]
+pub struct SanitizedGatewayConfig {
+    pub url: String,
+    pub tolerance_seconds: i64,
+    pub off_session_renewals: lnvps_db::GatewayOffSession,
+    pub handles: Vec<AdminPaymentMethodType>,
+    pub has_api_key: bool,
+    pub has_webhook_secret: bool,
+}
+
 /// Sanitized provider configuration - hides all secret/token values
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SanitizedProviderConfig {
+    Gateway(SanitizedGatewayConfig),
     Lnd(SanitizedLndConfig),
     Revolut(SanitizedRevolutConfig),
     Stripe(SanitizedStripeConfig),
@@ -4807,6 +4824,21 @@ impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
                     account: cfg.account.clone(),
                     min_confirmations: cfg.min_confirmations,
                     unpaid_purge_grace_hours: cfg.unpaid_purge_grace_hours,
+                })
+            }
+            lnvps_db::ProviderConfig::Gateway(cfg) => {
+                SanitizedProviderConfig::Gateway(SanitizedGatewayConfig {
+                    url: cfg.url.clone(),
+                    tolerance_seconds: cfg.tolerance_seconds,
+                    off_session_renewals: cfg.off_session_renewals,
+                    handles: cfg
+                        .handles
+                        .iter()
+                        .copied()
+                        .map(AdminPaymentMethodType::from)
+                        .collect(),
+                    has_api_key: !cfg.api_key.is_empty(),
+                    has_webhook_secret: !cfg.webhook_secret.is_empty(),
                 })
             }
             lnvps_db::ProviderConfig::FixedFloat(cfg) => {
@@ -5099,10 +5131,22 @@ pub struct PartialFixedFloatConfig {
     pub afftax: Option<Option<f32>>,
 }
 
+/// Partial gateway config for updates
+#[derive(Deserialize)]
+pub struct PartialGatewayConfig {
+    pub url: Option<String>,
+    pub api_key: Option<String>,
+    pub webhook_secret: Option<String>,
+    pub tolerance_seconds: Option<i64>,
+    pub off_session_renewals: Option<lnvps_db::GatewayOffSession>,
+    pub handles: Option<Vec<String>>,
+}
+
 /// Partial provider configuration for updates - only provided fields will be updated
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PartialProviderConfig {
+    Gateway(PartialGatewayConfig),
     Lnd(PartialLndConfig),
     Revolut(PartialRevolutConfig),
     Stripe(PartialStripeConfig),
@@ -5210,6 +5254,28 @@ impl PartialProviderConfig {
                     },
                 ))
             }
+            (PartialProviderConfig::Gateway(partial), ProviderConfig::Gateway(existing)) => {
+                Ok(ProviderConfig::Gateway(lnvps_db::GatewayProviderConfig {
+                    url: partial.url.unwrap_or_else(|| existing.url.clone()),
+                    api_key: partial.api_key.unwrap_or_else(|| existing.api_key.clone()),
+                    webhook_secret: partial
+                        .webhook_secret
+                        .unwrap_or_else(|| existing.webhook_secret.clone()),
+                    tolerance_seconds: partial
+                        .tolerance_seconds
+                        .unwrap_or(existing.tolerance_seconds),
+                    off_session_renewals: partial
+                        .off_session_renewals
+                        .unwrap_or(existing.off_session_renewals),
+                    handles: match partial.handles {
+                        Some(list) => list
+                            .iter()
+                            .map(|s| s.to_lowercase().parse::<lnvps_db::PaymentMethod>())
+                            .collect::<Result<Vec<_>, _>>()?,
+                        None => existing.handles.clone(),
+                    },
+                }))
+            }
             _ => Err(anyhow!(
                 "Cannot change provider type during update. Create a new config instead."
             )),
@@ -5225,6 +5291,7 @@ impl PartialProviderConfig {
             PartialProviderConfig::Paypal(_) => "paypal",
             PartialProviderConfig::OnChain(_) => "onchain",
             PartialProviderConfig::FixedFloat(_) => "fixedfloat",
+            PartialProviderConfig::Gateway(_) => "gateway",
         }
     }
 }

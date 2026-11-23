@@ -122,6 +122,12 @@ l4:
     namespace: "ingress-nginx"
     tcp-configmap: "tcp-services"
     udp-configmap: "udp-services"
+  # Used when forwarder is "traefik": IngressRouteTCP/UDP bound to entrypoints
+  # named <prefix><port> (g25565 ...), which Traefik must define.
+  traefik:
+    udp: false
+    tcp-entrypoint-prefix: "g"
+    udp-entrypoint-prefix: "gu"
 
 # --- Nostr domains ----------------------------------------------------------
 # Service name for nostr domain ingress (optional, defaults to "lnvps-nostr")

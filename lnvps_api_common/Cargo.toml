@@ -30,6 +30,7 @@ async-trait.workspace = true
 ipnetwork.workspace = true
 futures.workspace = true
 payments-rs = { workspace = true, features = ["fiat"] }
+payment-gateway-client = { git = "https://github.com/v0l/payment-gateway", rev = "7d9f8054638ec686be4f08756e8739ccd908bee8" }
 
 chrono = { version = "0.4", features = ["serde"] }
 base64 = { version = "0.22", features = ["alloc"] }

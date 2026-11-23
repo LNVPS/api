@@ -402,7 +402,7 @@ impl DbToolExecutor {
         Ok(Value::Array(
             configs
                 .into_iter()
-                .filter(|c| c.enabled)
+                .filter(|c| c.enabled && c.payment_method != lnvps_db::PaymentMethod::Gateway)
                 .map(|c| {
                     json!({
                         "method": c.payment_method.to_string(),
