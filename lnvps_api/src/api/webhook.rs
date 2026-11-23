@@ -7,7 +7,7 @@ use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::routing::{any, post};
 use futures::StreamExt;
-use lnvps_api_common::{GATEWAY_WEBHOOK_PATH, parse_gateway_event};
+use lnvps_api_common::{GATEWAY_WEBHOOK_PATH, parse_gateway_event, parse_gateway_event_with};
 use log::{error, warn};
 use payments_rs::webhook::{WEBHOOK_BRIDGE, WebhookMessage};
 use std::collections::HashMap;
@@ -62,19 +62,53 @@ fn collect_headers(headers: &axum::http::HeaderMap) -> HashMap<String, String> {
         .collect()
 }
 
+pub(crate) async fn verify_gateway_webhook(
+    state: &RouterState,
+    body: &[u8],
+    signature: Option<&str>,
+) -> anyhow::Result<Option<lnvps_api_common::GatewayEvent>> {
+    let rows: Vec<_> = state
+        .db
+        .list_payment_method_configs()
+        .await?
+        .iter()
+        .filter_map(lnvps_api_common::gateway_row)
+        .collect();
+    if !rows.is_empty() {
+        let mut last_err = None;
+        for row in rows.iter().filter(|r| r.enabled) {
+            match parse_gateway_event_with(
+                body,
+                signature,
+                &row.config.webhook_secret,
+                row.config.tolerance_seconds,
+            ) {
+                Ok(e) => return Ok(Some(e)),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        return match last_err {
+            Some(e) => Err(e),
+            None => Ok(None),
+        };
+    }
+    match state.settings.gateway.as_ref() {
+        Some(config) => Ok(Some(parse_gateway_event(body, signature, config)?)),
+        None => Ok(None),
+    }
+}
+
 async fn gateway_webhook(
     State(state): State<RouterState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
-    let Some(config) = state.settings.gateway.as_ref() else {
-        return StatusCode::NOT_FOUND;
-    };
     let signature = headers
         .get(payment_gateway_client::SIGNATURE_HEADER)
         .and_then(|v| v.to_str().ok());
-    let event = match parse_gateway_event(&body, signature, config) {
-        Ok(e) => e,
+    let event = match verify_gateway_webhook(&state, &body, signature).await {
+        Ok(Some(e)) => e,
+        Ok(None) => return StatusCode::NOT_FOUND,
         Err(e) => {
             warn!("{}", e);
             return StatusCode::UNAUTHORIZED;

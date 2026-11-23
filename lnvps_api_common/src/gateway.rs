@@ -395,12 +395,21 @@ pub fn parse_gateway_event(
     signature: Option<&str>,
     config: &GatewayConfig,
 ) -> Result<GatewayEvent> {
-    let value = verify_webhook(
+    parse_gateway_event_with(
         body,
         signature,
         &config.webhook_secret,
         config.webhook_tolerance_seconds,
     )
+}
+
+pub fn parse_gateway_event_with(
+    body: &[u8],
+    signature: Option<&str>,
+    secret: &str,
+    tolerance_seconds: i64,
+) -> Result<GatewayEvent> {
+    let value = verify_webhook(body, signature, secret, tolerance_seconds)
     .map_err(|e| anyhow::anyhow!("invalid gateway webhook: {e}"))?;
     let text =
         |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()).unwrap_or_default().to_string();
