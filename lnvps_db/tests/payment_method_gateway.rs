@@ -172,3 +172,92 @@ async fn expired_unpaid_gateway_payments_are_listed_and_nothing_else() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, vec![1u8; 32]);
 }
+
+#[tokio::test]
+async fn gateway_row_round_trips_and_payment_stats_count_only_that_company() {
+    use lnvps_db::{
+        GatewayOffSession, GatewayProviderConfig, LNVpsDbBase as _, PaymentMethodConfig,
+        ProviderConfig,
+    };
+    let Some(db) = db("pm_gateway_row").await else {
+        return;
+    };
+    let row = PaymentMethodConfig::new_with_config(
+        1,
+        PaymentMethod::Gateway,
+        "Gateway".to_string(),
+        false,
+        ProviderConfig::Gateway(GatewayProviderConfig {
+            url: "https://pay.example".to_string(),
+            api_key: "k".to_string(),
+            webhook_secret: "s".to_string(),
+            tolerance_seconds: 300,
+            off_session_renewals: GatewayOffSession::DryRun,
+            handles: vec![PaymentMethod::Lightning, PaymentMethod::Stripe],
+        }),
+    );
+    let id = db.insert_payment_method_config(&row).await.unwrap();
+    let stored = db.get_payment_method_config(id).await.unwrap();
+    assert_eq!(stored.payment_method, PaymentMethod::Gateway);
+    assert_eq!(stored.provider_type, "gateway");
+    assert!(!stored.enabled);
+    let cfg = stored.get_provider_config().unwrap();
+    let gw = cfg.as_gateway().unwrap();
+    assert_eq!(gw.off_session_renewals, GatewayOffSession::DryRun);
+    assert_eq!(
+        gw.handles,
+        vec![PaymentMethod::Lightning, PaymentMethod::Stripe]
+    );
+
+    let user = db.upsert_user(&[9u8; 32]).await.unwrap();
+    let (sub_id, _) = db
+        .insert_subscription_with_line_items(
+            &Subscription {
+                id: 0,
+                user_id: user,
+                company_id: 1,
+                name: "s".to_string(),
+                description: None,
+                created: chrono::Utc::now(),
+                expires: None,
+                is_active: true,
+                is_setup: false,
+                currency: "EUR".to_string(),
+                interval_amount: 1,
+                interval_type: IntervalType::Month,
+                setup_fee: 0,
+                auto_renewal_enabled: false,
+                external_id: None,
+            },
+            vec![SubscriptionLineItem {
+                id: 0,
+                subscription_id: 0,
+                subscription_type: LineItemType::Vps,
+                name: "vm".to_string(),
+                description: None,
+                amount: 1000,
+                setup_amount: 0,
+                configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let mut paid = gateway_payment(1, sub_id, user, Some("pgw:a"), true, 10);
+    paid.paid_at = Some(chrono::Utc::now());
+    for p in [
+        paid,
+        gateway_payment(2, sub_id, user, Some("pgw:b"), false, 10),
+        gateway_payment(3, sub_id, user, Some("in_process"), false, 10),
+    ] {
+        db.insert_subscription_payment(&p).await.unwrap();
+    }
+    let since = chrono::Utc::now() - chrono::Duration::hours(24);
+    let (count, last) = db.gateway_payment_stats(1, since).await.unwrap();
+    assert_eq!(count, 2);
+    assert!(last.is_some());
+    let (other, none) = db.gateway_payment_stats(2, since).await.unwrap();
+    assert_eq!(other, 0);
+    assert!(none.is_none());
+}
