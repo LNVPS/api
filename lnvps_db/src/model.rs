@@ -1556,6 +1556,15 @@ pub struct VmIpAssignment {
     pub dns_reverse_ref: Option<String>,
 }
 
+#[derive(FromRow, Clone, Debug, Default, PartialEq, Eq)]
+pub struct VmExtraAllowedIp {
+    pub id: u64,
+    pub vm_id: u64,
+    pub ip: String,
+    pub comment: String,
+    pub created: DateTime<Utc>,
+}
+
 impl Display for VmIpAssignment {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.ip)

@@ -15,10 +15,10 @@ use crate::{
     RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
     SubscriptionPaymentWithCompany, SwapOrderClient, Tunnel, TunnelPool, TunnelRoute, User,
     UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind, VmAddonPrice, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
-    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmIpWait, VmMigration, VmOsImage, VmTemplate,
-    VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice, VpnPeerTemplate, VpnService,
-    VpnSubscription, WebauthnCredential,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmExtraAllowedIp, VmFirewallPolicy,
+    VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmIpWait, VmMigration,
+    VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice,
+    VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -2931,6 +2931,39 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .fetch_one(&self.db)
             .await?
             .try_get(0)?)
+    }
+
+    async fn list_vm_extra_allowed_ips(&self, vm_id: u64) -> DbResult<Vec<VmExtraAllowedIp>> {
+        Ok(
+            sqlx::query_as("select * from vm_extra_allowed_ip where vm_id = ? order by id")
+                .bind(vm_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_vm_extra_allowed_ip(&self, entry: &VmExtraAllowedIp) -> DbResult<u64> {
+        Ok(sqlx::query(
+            "insert into vm_extra_allowed_ip(vm_id, ip, comment) values(?, ?, ?) returning id",
+        )
+        .bind(entry.vm_id)
+        .bind(&entry.ip)
+        .bind(&entry.comment)
+        .fetch_one(&self.db)
+        .await?
+        .try_get(0)?)
+    }
+
+    async fn delete_vm_extra_allowed_ip(&self, vm_id: u64, id: u64) -> DbResult<()> {
+        let res = sqlx::query("delete from vm_extra_allowed_ip where id = ? and vm_id = ?")
+            .bind(id)
+            .bind(vm_id)
+            .execute(&self.db)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound.into());
+        }
+        Ok(())
     }
 
     async fn get_vm_firewall_rule(&self, rule_id: u64) -> DbResult<VmFirewallRule> {

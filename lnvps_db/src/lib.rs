@@ -672,6 +672,12 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Delete assigned VM ip
     async fn delete_vm_ip_assignment(&self, assignment_id: u64) -> DbResult<()>;
 
+    async fn list_vm_extra_allowed_ips(&self, vm_id: u64) -> DbResult<Vec<VmExtraAllowedIp>>;
+
+    async fn insert_vm_extra_allowed_ip(&self, entry: &VmExtraAllowedIp) -> DbResult<u64>;
+
+    async fn delete_vm_extra_allowed_ip(&self, vm_id: u64, id: u64) -> DbResult<()>;
+
     /// Create a firewall rule, returns the new rule id
     async fn insert_vm_firewall_rule(&self, rule: &VmFirewallRule) -> DbResult<u64>;
 

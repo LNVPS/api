@@ -18,8 +18,8 @@ use lnvps_db::{
     Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany,
     Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind,
     VmAddonPrice, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment,
-    VmIpWait, VmMigration, VmMigrationState, VmOsImage, VmTemplate, VmTrafficDaily,
+    VmExtraAllowedIp, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
+    VmIpAssignment, VmIpWait, VmMigration, VmMigrationState, VmOsImage, VmTemplate, VmTrafficDaily,
     VmTrafficSample, VmTrafficTotal, VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription,
     WebauthnCredential,
 };
@@ -128,6 +128,7 @@ pub struct MockDb {
     pub router_bgp_sessions: Arc<Mutex<HashMap<u64, RouterBgpSession>>>,
     pub router_bgp_routes: Arc<Mutex<HashMap<u64, RouterBgpRoute>>>,
     pub firewall_rules: Arc<Mutex<HashMap<u64, VmFirewallRule>>>,
+    pub extra_allowed_ips: Arc<Mutex<Vec<VmExtraAllowedIp>>>,
     /// Daily traffic rows keyed by `(vm_id, day)` — the same composite primary
     /// key the table has.
     pub vm_traffic_daily: Arc<Mutex<HashMap<(u64, NaiveDate), VmTrafficDaily>>>,
@@ -647,6 +648,7 @@ impl Default for MockDb {
             router_bgp_sessions: Arc::new(Default::default()),
             router_bgp_routes: Arc::new(Default::default()),
             firewall_rules: Arc::new(Default::default()),
+            extra_allowed_ips: Arc::new(Default::default()),
             webauthn_credentials: Arc::new(Default::default()),
             api_tokens: Arc::new(Default::default()),
             apps: Arc::new(Default::default()),
@@ -2297,6 +2299,44 @@ impl LNVpsDbBase for MockDb {
             if ip_assignment.id == assignment_id {
                 ip_assignment.deleted = true;
             }
+        }
+        Ok(())
+    }
+
+    async fn list_vm_extra_allowed_ips(&self, vm_id: u64) -> DbResult<Vec<VmExtraAllowedIp>> {
+        Ok(self
+            .extra_allowed_ips
+            .lock()
+            .await
+            .iter()
+            .filter(|e| e.vm_id == vm_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn insert_vm_extra_allowed_ip(&self, entry: &VmExtraAllowedIp) -> DbResult<u64> {
+        let mut rows = self.extra_allowed_ips.lock().await;
+        if rows
+            .iter()
+            .any(|e| e.vm_id == entry.vm_id && e.ip == entry.ip)
+        {
+            return Err(DbError::Other(anyhow!("Duplicate entry")));
+        }
+        let id = rows.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        rows.push(VmExtraAllowedIp {
+            id,
+            created: Utc::now(),
+            ..entry.clone()
+        });
+        Ok(id)
+    }
+
+    async fn delete_vm_extra_allowed_ip(&self, vm_id: u64, id: u64) -> DbResult<()> {
+        let mut rows = self.extra_allowed_ips.lock().await;
+        let before = rows.len();
+        rows.retain(|e| !(e.id == id && e.vm_id == vm_id));
+        if rows.len() == before {
+            return Err(DbError::Other(anyhow!("Extra allowed IP {} not found", id)));
         }
         Ok(())
     }
