@@ -7,8 +7,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use lnvps_db::{
-    IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmFirewallRule, VmHost, VmHostDisk,
-    VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
+    IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmExtraAllowedIp, VmFirewallRule, VmHost,
+    VmHostDisk, VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
 };
 
 use crate::HostVmSpec;
@@ -591,6 +591,7 @@ pub struct FullVmInfo {
     pub ips: Vec<VmIpAssignment>,
     /// Ranges associated with [ips]
     pub ranges: Vec<IpRange>,
+    pub extra_allowed_ips: Vec<VmExtraAllowedIp>,
     /// SSH key to access the VM
     pub ssh_key: UserSshKey,
     /// User-configured firewall rules for this VM (ordered by priority)
@@ -629,6 +630,7 @@ impl FullVmInfo {
             None
         };
         let firewall_rules = db.list_vm_firewall_rules(vm_id).await?;
+        let extra_allowed_ips = db.list_vm_extra_allowed_ips(vm_id).await?;
         let transfer_gb = match (&template, &custom_template) {
             (Some(t), _) => t.transfer_gb,
             (_, Some(t)) => t.transfer_gb,
@@ -647,6 +649,7 @@ impl FullVmInfo {
             ips,
             disk,
             ranges,
+            extra_allowed_ips,
             ssh_key,
             firewall_rules,
             transfer_throttled,
@@ -1077,6 +1080,7 @@ mod tests {
                 key_data: "ssh-ed25519 AAA=".into(),
             },
             firewall_rules: vec![],
+            extra_allowed_ips: vec![],
             transfer_throttled: false,
         }
     }

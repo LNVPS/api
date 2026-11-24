@@ -302,15 +302,28 @@ impl ProxmoxClient {
         }
 
         let existing = self.list_vm_ipset_entries(&self.node, vm_id, SET).await?;
-        let wanted: Vec<IpAddr> = cfg
-            .ips
-            .iter()
-            .filter_map(|ip| ip.ip.parse::<IpAddr>().ok())
-            .collect();
+        let mut wanted: Vec<(IpAddr, String)> = Vec::new();
+        for ip in &cfg.ips {
+            if let Ok(addr) = ip.ip.parse::<IpAddr>() {
+                let comment = if addr.is_ipv4() {
+                    "VM IPv4 address"
+                } else {
+                    "VM IPv6 address"
+                };
+                wanted.push((addr, comment.to_string()));
+            }
+        }
+        for extra in &cfg.extra_allowed_ips {
+            if let Ok(addr) = extra.ip.parse::<IpAddr>()
+                && !wanted.iter().any(|(a, _)| *a == addr)
+            {
+                wanted.push((addr, extra.comment.clone()));
+            }
+        }
 
         for entry in &existing {
             if let Ok(addr) = entry.cidr.parse::<IpAddr>() {
-                if !wanted.contains(&addr) {
+                if !wanted.iter().any(|(a, _)| *a == addr) {
                     self.remove_vm_ipset_entry(&self.node, vm_id, SET, &entry.cidr)
                         .await?;
                 }
@@ -321,22 +334,17 @@ impl ProxmoxClient {
             .iter()
             .filter_map(|e| e.cidr.parse::<IpAddr>().ok())
             .collect();
-        for addr in wanted {
+        for (addr, comment) in wanted {
             if present.contains(&addr) {
                 continue;
             }
-            let comment = if addr.is_ipv4() {
-                "VM IPv4 address"
-            } else {
-                "VM IPv6 address"
-            };
             self.add_vm_ipset_entry(
                 &self.node,
                 vm_id,
                 SET,
                 CreateVmIpsetEntryRequest {
                     cidr: addr.to_string(),
-                    comment: Some(comment.to_string()),
+                    comment: Some(comment),
                     nomatch: None,
                 },
             )
@@ -3946,14 +3954,20 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("DELETE"))
-            .and(path_regex(r".*/qemu/101/firewall/ipset/ipfilter-net0/10\.9\.9\.244$"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})))
+            .and(path_regex(
+                r".*/qemu/101/firewall/ipset/ipfilter-net0/10\.9\.9\.244$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})),
+            )
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path_regex(r".*/qemu/101/firewall/ipset/ipfilter-net0$"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -3971,6 +3985,75 @@ mod tests {
         let mut info = mock_full_vm();
         info.vm.id = 1;
         info.ips.truncate(2);
+        client
+            .sync_ipfilter(&info)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ipfilter_sync_keeps_the_extra_allowed_ips() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/qemu/101/firewall/ipset/ipfilter-net0$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"cidr": "192.168.1.2", "comment": "VM IPv4 address"},
+                    {"cidr": "185.18.221.135", "comment": "k8s ingress VIP"},
+                    {"cidr": "2a13:2c0::4dbc:733d:4d68:2e08", "comment": "k8s ingress VIP"},
+                    {"cidr": "10.9.9.244", "comment": "VM IPv4 address"}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(
+                r".*/qemu/101/firewall/ipset/ipfilter-net0/10\.9\.9\.244$",
+            ))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})),
+            )
+            .expect(0)
+            .mount(&server)
+            .await;
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let client = ProxmoxClient::new(server.uri().parse()?, "pve", "", None, q_cfg, None);
+        let mut info = mock_full_vm();
+        info.vm.id = 1;
+        info.ips.truncate(1);
+        info.extra_allowed_ips = ["185.18.221.135", "2a13:2c0::4dbc:733d:4d68:2e08"]
+            .into_iter()
+            .map(|ip| lnvps_db::VmExtraAllowedIp {
+                vm_id: 1,
+                ip: ip.to_string(),
+                comment: "k8s ingress VIP".to_string(),
+                ..Default::default()
+            })
+            .collect();
         client
             .sync_ipfilter(&info)
             .await
