@@ -112,6 +112,10 @@ impl DbError {
     pub fn is_row_not_found(&self) -> bool {
         matches!(self, DbError::SqlxError(sqlx::Error::RowNotFound))
     }
+
+    pub fn row_not_found() -> Self {
+        DbError::SqlxError(sqlx::Error::RowNotFound)
+    }
 }
 
 impl From<DbError> for OpError<anyhow::Error> {
@@ -2471,6 +2475,7 @@ mod tests {
     #[test]
     fn test_is_row_not_found() {
         assert!(DbError::SqlxError(sqlx::Error::RowNotFound).is_row_not_found());
+        assert!(DbError::row_not_found().is_row_not_found());
         assert!(!DbError::Unknown.is_row_not_found());
         assert!(!DbError::SqlxError(sqlx::Error::PoolClosed).is_row_not_found());
     }

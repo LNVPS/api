@@ -2336,7 +2336,7 @@ impl LNVpsDbBase for MockDb {
         let before = rows.len();
         rows.retain(|e| !(e.id == id && e.vm_id == vm_id));
         if rows.len() == before {
-            return Err(DbError::Other(anyhow!("Extra allowed IP {} not found", id)));
+            return Err(DbError::row_not_found());
         }
         Ok(())
     }
@@ -2745,11 +2745,11 @@ impl LNVpsDbBase for MockDb {
 
     async fn get_vm_ip_assignment_by_ip(&self, ip: &str) -> DbResult<VmIpAssignment> {
         let assignments = self.ip_assignments.lock().await;
-        Ok(assignments
+        assignments
             .values()
-            .find(|a| a.ip == ip)
+            .find(|a| a.ip == ip && !a.deleted)
             .cloned()
-            .ok_or_else(|| anyhow!("IP assignment not found for {}", ip))?)
+            .ok_or_else(DbError::row_not_found)
     }
 
     async fn get_access_policy(&self, access_policy_id: u64) -> DbResult<AccessPolicy> {

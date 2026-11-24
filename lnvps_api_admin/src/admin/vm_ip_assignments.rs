@@ -4,14 +4,14 @@ use crate::admin::model::{
     AdminVmIpAssignmentInfo, CreateVmIpAssignmentRequest, JobResponse, UpdateVmIpAssignmentRequest,
 };
 use axum::extract::{Path, Query, State};
-use axum::routing::get;
+use axum::routing::{delete, get};
 use axum::{Json, Router};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, NetworkProvisioner, WorkJob,
 };
-use lnvps_db::{AdminAction, AdminResource};
-use serde::Deserialize;
+use lnvps_db::{AdminAction, AdminResource, VmExtraAllowedIp};
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 
 pub fn router() -> Router<RouterState> {
@@ -26,6 +26,204 @@ pub fn router() -> Router<RouterState> {
                 .patch(admin_update_vm_ip_assignment)
                 .delete(admin_delete_vm_ip_assignment),
         )
+        .route(
+            "/api/admin/v1/vms/{id}/extra_allowed_ips",
+            get(admin_list_vm_extra_allowed_ips).post(admin_add_vm_extra_allowed_ip),
+        )
+        .route(
+            "/api/admin/v1/vms/{id}/extra_allowed_ips/{entry_id}",
+            delete(admin_remove_vm_extra_allowed_ip),
+        )
+}
+
+#[derive(Serialize)]
+struct AdminVmExtraAllowedIp {
+    id: u64,
+    vm_id: u64,
+    ip: String,
+    comment: String,
+    created: DateTime<Utc>,
+}
+
+impl From<VmExtraAllowedIp> for AdminVmExtraAllowedIp {
+    fn from(e: VmExtraAllowedIp) -> Self {
+        Self {
+            id: e.id,
+            vm_id: e.vm_id,
+            ip: e.ip,
+            comment: e.comment,
+            created: e.created,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct AddVmExtraAllowedIpRequest {
+    ip: String,
+    comment: String,
+}
+
+const EXTRA_IP_COMMENT_MAX: usize = 200;
+
+fn parse_single_address(input: &str) -> Result<IpAddr, ApiError> {
+    let input = input.trim();
+    let (addr, prefix) = match input.split_once('/') {
+        Some((a, p)) => (a, Some(p)),
+        None => (input, None),
+    };
+    let addr: IpAddr = addr
+        .parse()
+        .map_err(|_| ApiError::bad_request("ip must be a literal IPv4 or IPv6 address"))?;
+    let full = if addr.is_ipv4() { "32" } else { "128" };
+    if prefix.is_some_and(|p| p != full) {
+        return Err(ApiError::bad_request(format!(
+            "ip must be a single address, a prefix other than /{full} is not allowed"
+        )));
+    }
+    Ok(addr)
+}
+
+fn validate_comment(comment: &str) -> Result<String, ApiError> {
+    let comment = comment.trim();
+    if comment.is_empty() {
+        return Err(ApiError::bad_request("comment is required"));
+    }
+    if comment.chars().count() > EXTRA_IP_COMMENT_MAX {
+        return Err(ApiError::bad_request(format!(
+            "comment must be at most {EXTRA_IP_COMMENT_MAX} characters"
+        )));
+    }
+    if comment.chars().any(char::is_control) {
+        return Err(ApiError::bad_request("comment must be a single line"));
+    }
+    Ok(comment.to_string())
+}
+
+async fn admin_list_vm_extra_allowed_ips(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<Vec<AdminVmExtraAllowedIp>> {
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::View)?;
+    this.db.get_vm(id).await?;
+    let rows = this.db.list_vm_extra_allowed_ips(id).await?;
+    ApiData::ok(rows.into_iter().map(Into::into).collect())
+}
+
+async fn admin_add_vm_extra_allowed_ip(
+    auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<AddVmExtraAllowedIpRequest>,
+) -> ApiResult<AdminVmExtraAllowedIp> {
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
+    let addr = parse_single_address(&req.ip)?;
+    let comment = validate_comment(&req.comment)?;
+    let vm = this.db.get_vm(id).await?;
+    if vm.deleted {
+        return Err(ApiError::conflict(
+            "Cannot add an allowed IP to a deleted VM",
+        ));
+    }
+    let ip = addr.to_string();
+    match this.db.get_vm_ip_assignment_by_ip(&ip).await {
+        Ok(owner) => {
+            let owner_vm = this.db.get_vm(owner.vm_id).await?;
+            if owner_vm.user_id != vm.user_id {
+                return Err(ApiError::conflict(format!(
+                    "{ip} is assigned to VM {} of another user",
+                    owner.vm_id
+                )));
+            }
+        }
+        Err(e) if e.is_row_not_found() => {}
+        Err(e) => return Err(e.into()),
+    }
+    if this
+        .db
+        .list_vm_extra_allowed_ips(id)
+        .await?
+        .iter()
+        .any(|e| e.ip == ip)
+    {
+        return Err(ApiError::conflict(format!(
+            "{ip} is already allowed on VM {id}"
+        )));
+    }
+
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("admin", Some(auth.user_id), "admin.vm.extra_ip.add")
+                .auth("nip98", None)
+                .target("vm", id)
+                .change(None, Some(format!("{ip} ({comment})"))),
+            &client,
+        ),
+    )
+    .await?;
+
+    let entry_id = this
+        .db
+        .insert_vm_extra_allowed_ip(&VmExtraAllowedIp {
+            vm_id: id,
+            ip: ip.clone(),
+            comment: comment.clone(),
+            ..Default::default()
+        })
+        .await?;
+    queue_firewall(&this, id).await;
+    let saved = this
+        .db
+        .list_vm_extra_allowed_ips(id)
+        .await?
+        .into_iter()
+        .find(|e| e.id == entry_id)
+        .ok_or_else(|| ApiError::internal("extra allowed IP vanished after insert"))?;
+    ApiData::ok(saved.into())
+}
+
+async fn admin_remove_vm_extra_allowed_ip(
+    auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
+    State(this): State<RouterState>,
+    Path((id, entry_id)): Path<(u64, u64)>,
+) -> ApiResult<()> {
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
+    let entry = this
+        .db
+        .list_vm_extra_allowed_ips(id)
+        .await?
+        .into_iter()
+        .find(|e| e.id == entry_id)
+        .ok_or_else(|| ApiError::not_found("Extra allowed IP not found"))?;
+
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("admin", Some(auth.user_id), "admin.vm.extra_ip.remove")
+                .auth("nip98", None)
+                .target("vm", id)
+                .change(Some(format!("{} ({})", entry.ip, entry.comment)), None),
+            &client,
+        ),
+    )
+    .await?;
+
+    this.db.delete_vm_extra_allowed_ip(id, entry_id).await?;
+    queue_firewall(&this, id).await;
+    ApiData::ok(())
+}
+
+async fn queue_firewall(this: &RouterState, vm_id: u64) {
+    if let Err(e) = this
+        .work_commander
+        .send(WorkJob::ApplyVmFirewall { vm_id })
+        .await
+    {
+        log::warn!("Failed to queue firewall update for VM {vm_id}: {e}");
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -319,5 +517,240 @@ async fn admin_delete_vm_ip_assignment(
             );
             ApiData::err("Failed to queue IP unassignment job")
         }
+    }
+}
+
+#[cfg(test)]
+mod extra_allowed_ip_tests {
+    use super::*;
+    use crate::admin::test_support::{Fixture, admin, fixture};
+    use lnvps_api_common::{ClientInfo, MockDb};
+    use lnvps_db::{LNVpsDbBase, VmIpAssignment};
+
+    const VIP4: &str = "185.18.221.135";
+    const VIP6: &str = "2a13:2c0::4dbc:733d:4d68:2e08";
+
+    fn editor() -> AdminAuth {
+        admin(
+            7,
+            &[
+                (AdminResource::VirtualMachines, AdminAction::View),
+                (AdminResource::VirtualMachines, AdminAction::Update),
+            ],
+        )
+    }
+
+    fn body(ip: &str) -> Json<AddVmExtraAllowedIpRequest> {
+        Json(AddVmExtraAllowedIpRequest {
+            ip: ip.to_string(),
+            comment: "k8s ingress VIP".to_string(),
+        })
+    }
+
+    async fn add(f: &Fixture, vm_id: u64, ip: &str) -> ApiResult<AdminVmExtraAllowedIp> {
+        admin_add_vm_extra_allowed_ip(
+            editor(),
+            ClientInfo::default(),
+            State(f.state.clone()),
+            Path(vm_id),
+            body(ip),
+        )
+        .await
+    }
+
+    async fn vm_of(f: &Fixture, user_id: u64) -> u64 {
+        let mut vm = MockDb::mock_vm();
+        vm.user_id = user_id;
+        vm.ssh_key_id = None;
+        f.mock.insert_vm(&vm).await.unwrap()
+    }
+
+    async fn assign(f: &Fixture, vm_id: u64, ip: &str) {
+        f.mock
+            .insert_vm_ip_assignment(&VmIpAssignment {
+                vm_id,
+                ip_range_id: 1,
+                ip: ip.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn only_a_single_address_is_accepted() {
+        assert_eq!(parse_single_address(VIP4).unwrap().to_string(), VIP4);
+        assert_eq!(
+            parse_single_address(" 185.18.221.135/32 ")
+                .unwrap()
+                .to_string(),
+            VIP4
+        );
+        assert_eq!(
+            parse_single_address("2a13:02c0:0:0:4dbc:733d:4d68:2e08/128")
+                .unwrap()
+                .to_string(),
+            VIP6
+        );
+        for bad in [
+            "185.18.221.0/24",
+            "185.18.221.135/31",
+            "2a13:2c0::/64",
+            "2a13:2c0::1/32",
+            "185.18.221.135/128",
+            "k8s.example.org",
+            "",
+            "185.18.221.135/",
+        ] {
+            assert!(parse_single_address(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_comment_is_one_short_line() {
+        assert_eq!(
+            validate_comment(" k8s ingress VIP ").unwrap(),
+            "k8s ingress VIP"
+        );
+        assert!(validate_comment("  ").is_err());
+        assert!(validate_comment("two\nlines").is_err());
+        assert!(validate_comment(&"x".repeat(EXTRA_IP_COMMENT_MAX + 1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_address_of_another_users_vm_is_refused() {
+        let f = fixture().await;
+        let other_user = f.mock.upsert_user(&[4u8; 32]).await.unwrap();
+        let other_vm = vm_of(&f, other_user).await;
+        assign(&f, other_vm, VIP4).await;
+
+        let err = add(&f, f.vm_id, VIP4).await.err().unwrap();
+        assert_eq!(err.code, axum::http::StatusCode::CONFLICT);
+        assert!(
+            f.mock
+                .list_vm_extra_allowed_ips(f.vm_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(f.audit_actions().await.is_empty());
+        assert_eq!(f.queued_jobs().await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_address_of_the_same_users_other_vm_is_allowed() {
+        let f = fixture().await;
+        let k8s1 = vm_of(&f, f.owner_id).await;
+        assign(&f, k8s1, VIP4).await;
+        add(&f, f.vm_id, VIP4).await.unwrap();
+        assert_eq!(
+            f.mock
+                .list_vm_extra_allowed_ips(f.vm_id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn add_list_remove_round_trip_is_audited_and_reapplies_the_firewall() {
+        let f = fixture().await;
+        let added = add(&f, f.vm_id, "2a13:02c0::4dbc:733d:4d68:2e08")
+            .await
+            .unwrap()
+            .0
+            .data;
+        assert_eq!(added.ip, VIP6);
+        assert_eq!(added.comment, "k8s ingress VIP");
+        assert_eq!(f.queued_jobs().await, 1);
+
+        let dup = add(&f, f.vm_id, VIP6).await.err().unwrap();
+        assert_eq!(dup.code, axum::http::StatusCode::CONFLICT);
+
+        let listed =
+            admin_list_vm_extra_allowed_ips(editor(), State(f.state.clone()), Path(f.vm_id))
+                .await
+                .unwrap()
+                .0
+                .data;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, added.id);
+
+        let wrong_vm = admin_remove_vm_extra_allowed_ip(
+            editor(),
+            ClientInfo::default(),
+            State(f.state.clone()),
+            Path((f.vm_id + 1, added.id)),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(wrong_vm.code, axum::http::StatusCode::NOT_FOUND);
+
+        admin_remove_vm_extra_allowed_ip(
+            editor(),
+            ClientInfo::default(),
+            State(f.state.clone()),
+            Path((f.vm_id, added.id)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            f.mock
+                .list_vm_extra_allowed_ips(f.vm_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(f.queued_jobs().await, 1);
+        assert_eq!(
+            f.audit_actions().await,
+            vec!["admin.vm.extra_ip.add", "admin.vm.extra_ip.remove"]
+        );
+        let log = f.mock.audit_log.lock().await;
+        assert_eq!(log[0].actor_id, Some(7));
+        assert_eq!(
+            log[0].target_id.as_deref(),
+            Some(f.vm_id.to_string().as_str())
+        );
+        assert!(log[0].after_summary.as_deref().unwrap().contains(VIP6));
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_write_blocks_the_change() {
+        let f = fixture().await;
+        f.break_audit_log();
+        assert!(add(&f, f.vm_id, VIP4).await.is_err());
+        assert!(
+            f.mock
+                .list_vm_extra_allowed_ips(f.vm_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn viewing_needs_vm_view_and_editing_needs_vm_update() {
+        let f = fixture().await;
+        let none = admin(9, &[]);
+        assert!(
+            admin_list_vm_extra_allowed_ips(none, State(f.state.clone()), Path(f.vm_id))
+                .await
+                .is_err()
+        );
+        let viewer = admin(9, &[(AdminResource::VirtualMachines, AdminAction::View)]);
+        assert!(
+            admin_add_vm_extra_allowed_ip(
+                viewer,
+                ClientInfo::default(),
+                State(f.state.clone()),
+                Path(f.vm_id),
+                body(VIP4),
+            )
+            .await
+            .is_err()
+        );
     }
 }
