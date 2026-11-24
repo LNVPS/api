@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-const NEWEST_GUESSED_VERSION: u64 = 20261024110000;
+const NEWEST_GUESSED_VERSION_APPLIED_IN_PROD: u64 = 20261201000000;
 
 fn migration_versions() -> Vec<(u64, String)> {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
@@ -39,12 +39,30 @@ fn migration_versions_are_unique() {
 fn new_migration_versions_are_real_times() {
     let guessed: Vec<_> = migration_versions()
         .into_iter()
-        .filter(|(version, _)| *version > NEWEST_GUESSED_VERSION && version % 10_000 == 0)
+        .filter(|(version, _)| {
+            *version > NEWEST_GUESSED_VERSION_APPLIED_IN_PROD && version % 10_000 == 0
+        })
         .map(|(_, name)| name)
         .collect();
     assert!(
         guessed.is_empty(),
         "these versions look made up, name migrations with `date -u +%Y%m%d%H%M%S`: {guessed:?}"
+    );
+}
+
+#[test]
+fn migrations_applied_in_prod_are_never_renamed_or_deleted() {
+    let present: Vec<_> = migration_versions()
+        .into_iter()
+        .map(|(_, name)| name)
+        .collect();
+    let missing: Vec<_> = include_str!("migrations_applied_in_prod.txt")
+        .lines()
+        .filter(|name| !name.is_empty() && !present.iter().any(|p| p == name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "migrations applied in production were renamed or deleted: {missing:?}"
     );
 }
 
