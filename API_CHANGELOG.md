@@ -20,6 +20,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- `POST /api/v1/vm` and `POST /api/v1/vm/custom-template` no longer require a verified email, for NIP-98 and API token callers alike; the 403 "Email verification is required before creating a VM" is gone. `GET /api/v1/account` still returns `email_verified` (null when no email is set). The web app prompts for verification before ordering.
 - Session tokens now default to 7 days (was 30). The `session.ttl` setting still overrides it.
 - NIP-98 single-use tracking is shared through Redis when configured.
 

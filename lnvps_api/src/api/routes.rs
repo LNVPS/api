@@ -1374,6 +1374,9 @@ async fn v1_custom_template_calc(
 /// VM's are initially created in "expired" state
 ///
 /// Unpaid VM orders will be deleted after 1 hour
+///
+/// A verified email address is not required to order. Verify one with
+/// /api/v1/account/verify-email to receive expiry and renewal notices by email.
 async fn v1_create_custom_vm_order(
     auth: Nip98Auth,
     client_ip: ClientIp,
@@ -1388,14 +1391,6 @@ async fn v1_create_custom_vm_order(
     capture_client_geo(&this, uid, client_ip).await;
 
     let user = this.db.get_user(uid).await?;
-    // Email verification is only enforced when SMTP is configured; otherwise
-    // there's no way to send the verification email, so the requirement is
-    // skipped to keep ordering usable on installs without email.
-    if this.settings.smtp.is_some() && !user.email_verified {
-        return Err(ApiError::forbidden(
-            "Email verification is required before creating a VM",
-        ));
-    }
 
     // create a fake template from the request to generate the order
     let template = req.spec.clone().into();
@@ -1528,6 +1523,9 @@ async fn v1_delete_ssh_key(
 /// VM's are initially created in "expired" state
 ///
 /// Unpaid VM orders will be deleted after 1 hour
+///
+/// A verified email address is not required to order. Verify one with
+/// /api/v1/account/verify-email to receive expiry and renewal notices by email.
 async fn v1_create_vm_order(
     auth: Nip98Auth,
     client_ip: ClientIp,
@@ -1542,13 +1540,6 @@ async fn v1_create_vm_order(
     capture_client_geo(&this, uid, client_ip).await;
 
     let user = this.db.get_user(uid).await?;
-    // Email verification is only enforced when SMTP is configured (see
-    // v1_create_custom_vm_order for rationale).
-    if this.settings.smtp.is_some() && !user.email_verified {
-        return Err(ApiError::forbidden(
-            "Email verification is required before creating a VM",
-        ));
-    }
 
     let template = this.db.get_vm_template(req.template_id).await?;
     let rsp = this
