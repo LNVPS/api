@@ -13,9 +13,14 @@ create unique index ix_vm_extra_allowed_ip_vm_ip on vm_extra_allowed_ip (vm_id, 
 insert into vm_extra_allowed_ip (vm_id, ip, comment)
 select v.id, vip.ip, 'k8s ingress VIP'
 from vm v
-         join vm k8s1 on k8s1.id = 2068 and k8s1.user_id = v.user_id
          cross join (select '185.18.221.135' as ip
                      union all
                      select '2a13:2c0::4dbc:733d:4d68:2e08') vip
 where v.id in (2068, 2069, 2146)
-  and v.deleted = 0;
+  and v.deleted = 0
+  and not exists (select 1
+                  from vm_ip_assignment a
+                           join vm o on o.id = a.vm_id
+                  where a.ip = vip.ip
+                    and a.deleted = 0
+                    and o.user_id <> v.user_id);

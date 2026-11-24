@@ -101,7 +101,7 @@ async fn migration_backfills_the_ingress_vips_on_the_k8s_vms_only() {
 }
 
 #[tokio::test]
-async fn migration_skips_vms_of_another_user_or_deleted() {
+async fn migration_skips_deleted_vms_and_vips_owned_by_another_user() {
     let Some((pool, _)) = fresh("extra_ip_other_user").await else {
         eprintln!("LNVPS_TEST_DATABASE_URL not set, skipping");
         return;
@@ -111,11 +111,28 @@ async fn migration_skips_vms_of_another_user_or_deleted() {
     insert_vm(&pool, 2068, 1, false).await;
     insert_vm(&pool, 2069, 2, false).await;
     insert_vm(&pool, 2146, 1, true).await;
+    insert_vm(&pool, 2147, 1, false).await;
+    sqlx::query("INSERT INTO vm_ip_assignment (vm_id, ip_range_id, ip) VALUES (2068, 1, ?)")
+        .bind(VIP4)
+        .execute(&pool)
+        .await
+        .unwrap();
     pool.execute("SET FOREIGN_KEY_CHECKS = 1").await.unwrap();
     migrate(&pool, |_| true).await;
 
-    let vms: Vec<u64> = extras(&pool).await.into_iter().map(|e| e.0).collect();
-    assert_eq!(vms, vec![2068, 2068]);
+    let got: Vec<(u64, String)> = extras(&pool)
+        .await
+        .into_iter()
+        .map(|e| (e.0, e.1))
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (2068, VIP4.to_string()),
+            (2068, VIP6.to_string()),
+            (2069, VIP6.to_string()),
+        ]
+    );
     pool.execute("DROP DATABASE extra_ip_other_user")
         .await
         .unwrap();
