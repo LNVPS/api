@@ -9660,4 +9660,239 @@ mod tests {
         assert_eq!(template.network_mbps, None, "an uncapped VM stays uncapped");
         Ok(())
     }
+
+    mod ingress_vip_ipfilter {
+        use super::*;
+        use lnvps_api_common::host::config::FirewallConfig;
+        use std::collections::BTreeSet;
+        use std::sync::Mutex as StdMutex;
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        const VIP4: &str = "185.18.221.135";
+        const VIP6: &str = "2a13:2c0::4dbc:733d:4d68:2e08";
+
+        type IpSets = Arc<StdMutex<HashMap<(String, String), BTreeSet<String>>>>;
+
+        struct FakeProxmox {
+            sets: IpSets,
+        }
+
+        fn ok(data: serde_json::Value) -> ResponseTemplate {
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": data }))
+        }
+
+        impl Respond for FakeProxmox {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                let path = req.url.path().to_string();
+                let parts: Vec<String> = path
+                    .trim_start_matches("/api2/json/")
+                    .split('/')
+                    .map(|p| urlencoding::decode(p).unwrap().into_owned())
+                    .collect();
+                let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
+                let method = req.method.as_str();
+                match (method, parts.as_slice()) {
+                    ("GET", ["nodes"]) => ok(serde_json::json!([
+                        {"node": "k8s-1", "status": "online", "maxcpu": 4, "maxmem": 1u64 << 34},
+                        {"node": "k8s-2", "status": "online", "maxcpu": 4, "maxmem": 1u64 << 34},
+                        {"node": "k8s-3", "status": "online", "maxcpu": 4, "maxmem": 1u64 << 34}
+                    ])),
+                    ("GET", ["nodes", _, "storage"]) => ok(serde_json::json!([])),
+                    ("GET", ["nodes", _, "qemu", vmid, "config"]) => ok(serde_json::json!({
+                        "digest": "d",
+                        "scsi0": format!("mock-disk:vm-{vmid}-disk-0,size=100G"),
+                    })),
+                    ("POST", ["nodes", node, "qemu", _, "config"]) => ok(serde_json::json!(
+                        format!("UPID:{node}:0:0:0:qmconfig::root@pam:")
+                    )),
+                    ("PUT", ["nodes", _, "qemu", _, "firewall", "options"]) => {
+                        ok(serde_json::json!(null))
+                    }
+                    ("GET", ["nodes", _, "qemu", _, "firewall", "rules"]) => {
+                        ok(serde_json::json!([]))
+                    }
+                    ("GET", ["nodes", node, "qemu", vmid, "firewall", "ipset", _]) => {
+                        let sets = self.sets.lock().unwrap();
+                        match sets.get(&(node.to_string(), vmid.to_string())) {
+                            Some(set) => ok(serde_json::Value::Array(
+                                set.iter()
+                                    .map(|cidr| serde_json::json!({ "cidr": cidr }))
+                                    .collect(),
+                            )),
+                            None => ResponseTemplate::new(404),
+                        }
+                    }
+                    ("POST", ["nodes", node, "qemu", vmid, "firewall", "ipset"]) => {
+                        self.sets
+                            .lock()
+                            .unwrap()
+                            .entry((node.to_string(), vmid.to_string()))
+                            .or_default();
+                        ok(serde_json::json!(null))
+                    }
+                    ("POST", ["nodes", node, "qemu", vmid, "firewall", "ipset", _]) => {
+                        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+                        self.sets
+                            .lock()
+                            .unwrap()
+                            .entry((node.to_string(), vmid.to_string()))
+                            .or_default()
+                            .insert(body["cidr"].as_str().unwrap().to_string());
+                        ok(serde_json::json!(null))
+                    }
+                    ("DELETE", ["nodes", node, "qemu", vmid, "firewall", "ipset", _, cidr]) => {
+                        if let Some(set) = self
+                            .sets
+                            .lock()
+                            .unwrap()
+                            .get_mut(&(node.to_string(), vmid.to_string()))
+                        {
+                            set.remove(*cidr);
+                        }
+                        ok(serde_json::json!(null))
+                    }
+                    _ => ResponseTemplate::new(501).set_body_string(format!("{method} {path}")),
+                }
+            }
+        }
+
+        async fn proxmox_host(db: &Arc<MockDb>, server: &MockServer, name: &str) -> Result<u64> {
+            let host_id = db
+                .create_host(&VmHost {
+                    kind: VmHostKind::Proxmox,
+                    region_id: 1,
+                    name: name.to_string(),
+                    ip: server.uri(),
+                    enabled: true,
+                    ..Default::default()
+                })
+                .await?;
+            db.host_disks.lock().await.insert(
+                host_id,
+                lnvps_db::VmHostDisk {
+                    id: host_id,
+                    host_id,
+                    name: "mock-disk".to_string(),
+                    enabled: true,
+                    ..Default::default()
+                },
+            );
+            Ok(host_id)
+        }
+
+        async fn k8s_vm(db: &Arc<MockDb>, host_id: u64, own_ip: &str) -> Result<u64> {
+            let (vm_id, _) = add_vm_with_subscription(db, Utc::now(), true).await?;
+            {
+                let mut vms = db.vms.lock().await;
+                let vm = vms.get_mut(&vm_id).unwrap();
+                vm.host_id = host_id;
+                vm.disk_id = host_id;
+            }
+            db.insert_vm_ip_assignment(&lnvps_db::VmIpAssignment {
+                vm_id,
+                ip_range_id: 1,
+                ip: own_ip.to_string(),
+                ..Default::default()
+            })
+            .await?;
+            Ok(vm_id)
+        }
+
+        async fn assign(db: &Arc<MockDb>, vm_id: u64, ip: &str, range: u64) -> Result<()> {
+            db.insert_vm_ip_assignment(&lnvps_db::VmIpAssignment {
+                vm_id,
+                ip_range_id: range,
+                ip: ip.to_string(),
+                ..Default::default()
+            })
+            .await?;
+            Ok(())
+        }
+
+        async fn extra(db: &Arc<MockDb>, vm_id: u64, ip: &str) -> Result<()> {
+            db.insert_vm_extra_allowed_ip(&lnvps_db::VmExtraAllowedIp {
+                vm_id,
+                ip: ip.to_string(),
+                comment: "k8s ingress VIP".to_string(),
+                ..Default::default()
+            })
+            .await?;
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn patch_hosts_keeps_the_ingress_vips_on_every_k8s_node() -> Result<()> {
+            let server = MockServer::start().await;
+            let sets: IpSets = Default::default();
+            Mock::given(wiremock::matchers::any())
+                .respond_with(FakeProxmox { sets: sets.clone() })
+                .mount(&server)
+                .await;
+
+            let db = Arc::new(MockDb::default());
+            let k8s1_host = proxmox_host(&db, &server, "k8s-1").await?;
+            let k8s2_host = proxmox_host(&db, &server, "k8s-2").await?;
+            let k8s3_host = proxmox_host(&db, &server, "k8s-3").await?;
+            let k8s1 = k8s_vm(&db, k8s1_host, VIP4).await?;
+            let k8s2 = k8s_vm(&db, k8s2_host, "10.0.0.12").await?;
+            let k8s3 = k8s_vm(&db, k8s3_host, "10.0.0.13").await?;
+            assign(&db, k8s1, VIP6, 2).await?;
+            for vm in [k8s2, k8s3] {
+                extra(&db, vm, VIP4).await?;
+                extra(&db, vm, VIP6).await?;
+            }
+
+            {
+                let mut s = sets.lock().unwrap();
+                for (node, vm, own) in [("k8s-2", k8s2, "10.0.0.12"), ("k8s-3", k8s3, "10.0.0.13")]
+                {
+                    s.insert(
+                        (node.to_string(), (vm + 100).to_string()),
+                        [own, VIP4, VIP6, "10.9.9.9"]
+                            .into_iter()
+                            .map(String::from)
+                            .collect(),
+                    );
+                }
+            }
+
+            let mut settings = mock_settings();
+            settings
+                .provisioner
+                .proxmox
+                .as_mut()
+                .unwrap()
+                .qemu
+                .firewall_config = Some(FirewallConfig {
+                dhcp: None,
+                enable: Some(true),
+                ip_filter: Some(true),
+                mac_filter: Some(true),
+                ndp: None,
+                policy_in: None,
+                policy_out: None,
+            });
+            let mut worker = setup_worker(db.clone()).await?;
+            worker.settings = (&settings).into();
+
+            for _ in 0..2 {
+                worker.try_job(&WorkJob::PatchHosts).await?;
+            }
+
+            let s = sets.lock().unwrap();
+            for (node, vm, own) in [
+                ("k8s-1", k8s1, VIP4),
+                ("k8s-2", k8s2, "10.0.0.12"),
+                ("k8s-3", k8s3, "10.0.0.13"),
+            ] {
+                let got = s
+                    .get(&(node.to_string(), (vm + 100).to_string()))
+                    .unwrap_or_else(|| panic!("{node} has no ipfilter set"));
+                let want: BTreeSet<String> =
+                    [own, VIP4, VIP6].into_iter().map(String::from).collect();
+                assert_eq!(got, &want, "{node}");
+            }
+            Ok(())
+        }
+    }
 }
