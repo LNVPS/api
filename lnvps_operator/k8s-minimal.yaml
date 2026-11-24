@@ -58,10 +58,12 @@ rules:
   resources: ["deployments"]
   verbs: ["list", "create", "patch"]
 # Nostr domain ingresses are read, replaced and deleted by name; app ingresses
-# are server-side applied.
+# are server-side applied. `list` is cluster-wide because a custom domain has
+# to be checked against every Ingress in the cluster before it is served, not
+# only the ones this operator owns.
 - apiGroups: ["networking.k8s.io"]
   resources: ["ingresses"]
-  verbs: ["get", "create", "update", "patch", "delete"]
+  verbs: ["get", "list", "create", "update", "patch", "delete"]
 - apiGroups: ["networking.k8s.io"]
   resources: ["networkpolicies"]
   verbs: ["create", "patch"]

@@ -1095,6 +1095,101 @@ pub fn build_custom_domain_ingress(
     })
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct IngressHosts(BTreeMap<String, BTreeSet<String>>);
+
+impl IngressHosts {
+    pub fn from_ingresses(items: impl IntoIterator<Item = Ingress>) -> Self {
+        let mut hosts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for ing in items {
+            let Some(namespace) = ing.metadata.namespace.clone() else {
+                continue;
+            };
+            let spec = ing.spec.unwrap_or_default();
+            let rule_hosts = spec.rules.into_iter().flatten().filter_map(|r| r.host);
+            let tls_hosts = spec
+                .tls
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t.hosts)
+                .flatten();
+            for host in rule_hosts.chain(tls_hosts) {
+                hosts
+                    .entry(normalize_host(&host))
+                    .or_default()
+                    .insert(namespace.clone());
+            }
+        }
+        Self(hosts)
+    }
+
+    pub fn served_elsewhere(&self, host: &str, own: &str) -> Vec<String> {
+        self.0
+            .get(&normalize_host(host))
+            .map(|namespaces| {
+                namespaces
+                    .iter()
+                    .filter(|n| n.as_str() != own)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+fn normalize_host(host: &str) -> String {
+    host.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+async fn load_ingress_hosts(client: &Client) -> Option<IngressHosts> {
+    let api: Api<Ingress> = Api::all(client.clone());
+    match api.list(&ListParams::default()).await {
+        Ok(list) => Some(IngressHosts::from_ingresses(list.items)),
+        Err(e) => {
+            warn!("custom domain check: could not list ingresses: {e}");
+            None
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DomainHold {
+    WaitingForDns,
+    ServedElsewhere(Vec<String>),
+    ClusterUnreadable,
+}
+
+impl DomainHold {
+    fn message(&self, domain: &str, hostname: &str) -> String {
+        match self {
+            Self::WaitingForDns => format!("{domain} does not resolve to {hostname}"),
+            Self::ServedElsewhere(namespaces) => format!(
+                "{domain} is already served by an ingress in {}",
+                namespaces.join(", ")
+            ),
+            Self::ClusterUnreadable => {
+                format!("could not list ingresses to check whether {domain} is free")
+            }
+        }
+    }
+}
+
+fn domain_claimed_elsewhere(
+    deployment_id: u64,
+    domain: &str,
+    ingress_hosts: Option<&IngressHosts>,
+) -> Option<DomainHold> {
+    let hosts = ingress_hosts?;
+    let elsewhere = hosts.served_elsewhere(domain, &namespace_name(deployment_id));
+    (!elsewhere.is_empty()).then_some(DomainHold::ServedElsewhere(elsewhere))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DomainProbe {
+    Released,
+    Held(DomainHold),
+}
+
 /// Whether `domain` resolves to an address `hostname` also resolves to.
 ///
 /// Address overlap rather than a CNAME check: a customer may point an A record
@@ -1175,6 +1270,7 @@ pub fn deployment_hostname(name: &str, ingress_domain: &str) -> String {
 /// annotation asking cert-manager for a certificate whose HTTP-01 challenge
 /// would fail on every pass and spend the account's failed validation budget.
 ///
+///
 /// The flag is returned on the struct — not merely written to the DB — because
 /// the status write-back at the end of the pass rewrites the whole row from the
 /// in-memory deployment. A flag that exists only in the DB is overwritten with
@@ -1185,15 +1281,21 @@ async fn resolve_custom_domain(
     db: &Arc<dyn LNVpsDb>,
     deployment: &AppDeployment,
     hostname: &str,
+    ingress_hosts: Option<&IngressHosts>,
 ) -> Result<AppDeployment> {
-    let probe_passed = match deployment.custom_domain.as_deref() {
+    let probe = match deployment.custom_domain.as_deref() {
         // Verified is sticky, so an already-verified domain is never re-probed.
         Some(cd) if !deployment.custom_domain_verified => {
-            resolves_to_same_address(cd, hostname).await
+            match domain_claimed_elsewhere(deployment.id, cd, ingress_hosts) {
+                Some(hold) => DomainProbe::Held(hold),
+                None if ingress_hosts.is_none() => DomainProbe::Held(DomainHold::ClusterUnreadable),
+                None if resolves_to_same_address(cd, hostname).await => DomainProbe::Released,
+                None => DomainProbe::Held(DomainHold::WaitingForDns),
+            }
         }
-        _ => false,
+        _ => DomainProbe::Held(DomainHold::WaitingForDns),
     };
-    apply_custom_domain_probe(db, deployment, probe_passed, hostname).await
+    apply_custom_domain_probe(db, deployment, &probe, hostname).await
 }
 
 /// Persist a passing probe and return the deployment as the rest of the pass
@@ -1202,7 +1304,7 @@ async fn resolve_custom_domain(
 async fn apply_custom_domain_probe(
     db: &Arc<dyn LNVpsDb>,
     deployment: &AppDeployment,
-    probe_passed: bool,
+    probe: &DomainProbe,
     hostname: &str,
 ) -> Result<AppDeployment> {
     let id = deployment.id;
@@ -1212,8 +1314,13 @@ async fn apply_custom_domain_probe(
     if deployment.custom_domain_verified {
         return Ok(deployment.clone());
     }
-    if !probe_passed {
-        info!("app deployment {id} custom domain held: {cd} does not resolve to {hostname}");
+    if let DomainProbe::Held(hold) = probe {
+        let message = hold.message(cd, hostname);
+        if matches!(hold, DomainHold::WaitingForDns) {
+            info!("app deployment {id} custom domain held: {message}");
+        } else {
+            warn!("app deployment {id} custom domain held: {message}");
+        }
         return Ok(deployment.clone());
     }
     db.set_app_deployment_custom_domain_verified(id).await?;
@@ -1595,6 +1702,7 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<BTreeSet<u64>> {
 
     let mut active: HashSet<u64> = HashSet::new();
     let mut transitioning: BTreeSet<u64> = BTreeSet::new();
+    let ingress_hosts = load_ingress_hosts(&ctx.client).await;
     let (deployments, l4_failures) = reconcile_l4(ctx, deployments).await;
     if let Err(e) = reconcile_srv_dns(ctx, &cluster, &deployments, &l4_failures).await {
         warn!("SRV DNS sync failed: {e}");
@@ -1609,7 +1717,7 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<BTreeSet<u64>> {
             let _ = ctx.db.update_app_deployment(&errd).await;
             continue;
         }
-        match reconcile_one(ctx, d, &cluster.ingress_domain).await {
+        match reconcile_one(ctx, d, &cluster.ingress_domain, ingress_hosts.as_ref()).await {
             Ok(status) => {
                 if is_transitioning(status) {
                     transitioning.insert(d.id);
@@ -1875,6 +1983,7 @@ async fn reconcile_one(
     ctx: &Context,
     deployment: &AppDeployment,
     ingress_domain: &str,
+    ingress_hosts: Option<&IngressHosts>,
 ) -> Result<AppDeploymentStatus> {
     let client = &ctx.client;
     let id = deployment.id;
@@ -1970,7 +2079,7 @@ async fn reconcile_one(
     // host customers actually connect on, and an app that derives identity from
     // it (a relay's `RELAY_URL`, a public base URL) must be told the custom
     // domain, not the cluster hostname it is merely reachable at.
-    let deployment = &resolve_custom_domain(&ctx.db, deployment, &hostname).await?;
+    let deployment = &resolve_custom_domain(&ctx.db, deployment, &hostname, ingress_hosts).await?;
     let custom_domain = servable_custom_domain(deployment);
     let public_hostname = public_hostname(&hostname, deployment);
     let config = parse_config(&deployment.config);
@@ -4406,9 +4515,14 @@ config:
         // must see the flag: the write-back rebuilds the whole row from the
         // struct it is handed, so it is the struct — not the DB — that carries
         // the result of the probe forward.
-        let verified = apply_custom_domain_probe(&db, &stale, true, "app-1.apps.example.com")
-            .await
-            .unwrap();
+        let verified = apply_custom_domain_probe(
+            &db,
+            &stale,
+            &DomainProbe::Released,
+            "app-1.apps.example.com",
+        )
+        .await
+        .unwrap();
         assert!(
             verified.custom_domain_verified,
             "a passing probe must be returned on the struct, not left in the DB"
@@ -4507,5 +4621,102 @@ config:
             created: chrono::Utc::now(),
             deleted: false,
         }
+    }
+
+    fn ingress_in(namespace: &str, host: &str) -> Ingress {
+        Ingress {
+            metadata: ObjectMeta {
+                namespace: Some(namespace.to_string()),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                rules: Some(vec![IngressRule {
+                    host: Some(host.to_string()),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_host_another_ingress_serves_is_not_free() {
+        let hosts = IngressHosts::from_ingresses([
+            ingress_in("nostr-domains", "relay.example.org"),
+            ingress_in("app-1", "relay.example.org"),
+        ]);
+        assert_eq!(
+            hosts.served_elsewhere("relay.example.org", "app-1"),
+            vec!["nostr-domains".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_host_only_the_deployments_own_ingress_serves_is_free() {
+        let hosts = IngressHosts::from_ingresses([ingress_in("app-1", "relay.example.org")]);
+        assert!(
+            hosts
+                .served_elsewhere("relay.example.org", "app-1")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn host_comparison_ignores_case_and_a_trailing_dot() {
+        let hosts =
+            IngressHosts::from_ingresses([ingress_in("nostr-domains", "Relay.Example.ORG.")]);
+        assert_eq!(
+            hosts.served_elsewhere("relay.example.org", "app-1"),
+            vec!["nostr-domains".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_tls_only_host_is_a_claim() {
+        let hosts = IngressHosts::from_ingresses([Ingress {
+            metadata: ObjectMeta {
+                namespace: Some("nostr-domains".to_string()),
+                ..Default::default()
+            },
+            spec: Some(IngressSpec {
+                tls: Some(vec![IngressTLS {
+                    hosts: Some(vec!["relay.example.org".to_string()]),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }]);
+        assert_eq!(
+            hosts.served_elsewhere("relay.example.org", "app-1"),
+            vec!["nostr-domains".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_hold_reason_names_the_problem() {
+        assert_eq!(
+            DomainHold::WaitingForDns.message("relay.example.org", "app-1.apps.example.com"),
+            "relay.example.org does not resolve to app-1.apps.example.com"
+        );
+        assert_eq!(
+            DomainHold::ServedElsewhere(vec!["nostr-domains".to_string()])
+                .message("relay.example.org", "app-1.apps.example.com"),
+            "relay.example.org is already served by an ingress in nostr-domains"
+        );
+    }
+
+    #[test]
+    fn a_claimed_host_holds_the_domain_before_the_probe_runs() {
+        let hosts =
+            IngressHosts::from_ingresses([ingress_in("nostr-domains", "relay.example.org")]);
+        assert_eq!(
+            domain_claimed_elsewhere(1, "relay.example.org", Some(&hosts)),
+            Some(DomainHold::ServedElsewhere(vec![
+                "nostr-domains".to_string()
+            ]))
+        );
+        assert_eq!(domain_claimed_elsewhere(1, "relay.example.org", None), None);
     }
 }
