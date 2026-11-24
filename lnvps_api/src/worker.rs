@@ -4424,6 +4424,7 @@ impl Worker {
                         *ssh_key_id,
                         ref_code.clone(),
                         *host_id,
+                        None,
                     )
                     .await?;
 
@@ -4469,7 +4470,14 @@ impl Worker {
 
                 let provisioner = self.subscription_handler.vm_provisioner();
                 let vm = provisioner
-                    .provision_custom(*user_id, template, *image_id, *ssh_key_id, ref_code.clone())
+                    .provision_custom(
+                        *user_id,
+                        template,
+                        *image_id,
+                        *ssh_key_id,
+                        ref_code.clone(),
+                        None,
+                    )
                     .await?;
 
                 let metadata = Some(serde_json::json!({

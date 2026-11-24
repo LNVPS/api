@@ -1511,6 +1511,7 @@ pub struct Vm {
     pub subscription_line_item_id: u64,
     /// Users ssh-key assigned to this VM (None once the VM is deleted)
     pub ssh_key_id: Option<u64>,
+    pub user_data: Option<EncryptedString>,
     /// The [VmHostDisk] this VM is on
     pub disk_id: u64,
     /// Network MAC address

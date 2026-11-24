@@ -676,3 +676,106 @@ impl crate::swap::SwapProvider for MockSwapProvider {
         })
     }
 }
+
+#[derive(Clone)]
+pub struct UserDataHost {
+    pub inner: DummyVmHost,
+    pub capability: u8,
+    pub calls: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl UserDataHost {
+    pub fn new(capability: u8) -> Self {
+        Self {
+            inner: DummyVmHost::new(),
+            capability,
+            calls: Default::default(),
+        }
+    }
+}
+
+macro_rules! user_data_host {
+    ($(fn $name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)+) => {
+        #[async_trait]
+        impl VmHostClient for UserDataHost {
+            async fn supports_user_data(&self) -> OpResult<bool> {
+                self.calls.lock().unwrap().push("supports_user_data");
+                match self.capability {
+                    0 => Ok(false),
+                    1 => Ok(true),
+                    _ => Err(OpError::Fatal(anyhow!("capability lookup failed"))),
+                }
+            }
+            $(async fn $name(&self, $($arg: $ty),*) -> $ret {
+                self.calls.lock().unwrap().push(stringify!($name));
+                self.inner.$name($($arg),*).await
+            })+
+        }
+    };
+}
+
+user_data_host! {
+    fn list_host_vms() -> OpResult<Vec<lnvps_api_common::HostVmSpec>>;
+    fn get_info() -> OpResult<VmHostInfo>;
+    fn list_snapshots(vm: &Vm) -> OpResult<Vec<crate::host::VmSnapshot>>;
+    fn create_snapshot(vm: &Vm, name: &str, description: Option<&str>) -> OpResult<()>;
+    fn rollback_snapshot(vm: &Vm, name: &str) -> OpResult<()>;
+    fn delete_snapshot(vm: &Vm, name: &str) -> OpResult<()>;
+    fn download_os_image(image: &VmOsImage) -> OpResult<()>;
+    fn generate_mac(vm: &Vm) -> OpResult<String>;
+    fn start_vm(vm: &Vm) -> OpResult<()>;
+    fn stop_vm(vm: &Vm) -> OpResult<()>;
+    fn reset_vm(vm: &Vm) -> OpResult<()>;
+    fn create_vm(cfg: &FullVmInfo) -> OpResult<()>;
+    fn delete_vm(vm: &Vm) -> OpResult<()>;
+    fn unlink_primary_disk(vm: &Vm) -> OpResult<()>;
+    fn import_template_disk(cfg: &FullVmInfo) -> OpResult<()>;
+    fn resize_disk(cfg: &FullVmInfo) -> OpResult<()>;
+    fn get_vm_state(vm: &Vm) -> OpResult<VmRunningState>;
+    fn get_all_vm_states() -> OpResult<Vec<(u64, VmRunningState)>>;
+    fn configure_vm(cfg: &FullVmInfo) -> OpResult<()>;
+    fn patch_firewall(cfg: &FullVmInfo) -> OpResult<()>;
+    fn get_time_series_data(vm: &Vm, series: TimeSeries) -> OpResult<Vec<TimeSeriesData>>;
+    fn connect_terminal(vm: &Vm) -> OpResult<TerminalStream>;
+    fn migrate_vm(vm: &Vm, req: &crate::host::MigrateVmRequest) -> OpResult<()>;
+    fn export_primary_disk(vm: &Vm) -> OpResult<crate::host::DiskStream>;
+    fn create_vm_from_disk(cfg: &FullVmInfo, disk: crate::host::DiskStream) -> OpResult<crate::host::ImportedDisk>;
+    fn retire_vm(vm: &Vm) -> OpResult<()>;
+}
+
+#[cfg(test)]
+mod user_data_host_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn list_host_vms_matches_inner_dummy_host() -> anyhow::Result<()> {
+        let host_id = 987654;
+        let mut host = UserDataHost::new(1);
+        host.inner = DummyVmHost::new().with_host_id(host_id);
+        DummyVmHost::set_host_vms_for(
+            host_id,
+            vec![lnvps_api_common::HostVmSpec {
+                host_vm_id: 142,
+                mapped_vm_id: Some(42),
+                name: Some("scripted-vm".into()),
+                cpu: 2,
+                memory: 4 * lnvps_api_common::GB,
+                disk_size: 20 * lnvps_api_common::GB,
+                disk_storage: Some("mock-disk".into()),
+                mac_address: Some("02:00:00:00:00:42".into()),
+                running: true,
+            }],
+        )
+        .await;
+        let expected = host.inner.list_host_vms().await?;
+        let actual = host.list_host_vms().await?;
+        assert_eq!(expected.len(), 1);
+        assert_eq!(
+            serde_json::to_value(actual)?,
+            serde_json::to_value(expected)?
+        );
+        assert_eq!(*host.calls.lock().unwrap(), vec!["list_host_vms"]);
+        DummyVmHost::set_host_vms_for(host_id, vec![]).await;
+        Ok(())
+    }
+}

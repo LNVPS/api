@@ -332,8 +332,23 @@ pub fn extract_host_from_url(input: &str) -> String {
 }
 
 /// Generic type for creating VM's
+#[derive(Debug)]
+pub struct UserDataUnsupported;
+
+impl std::fmt::Display for UserDataUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("This region's host cannot deliver user_data")
+    }
+}
+
+impl std::error::Error for UserDataUnsupported {}
+
 #[async_trait]
 pub trait VmHostClient: Send + Sync {
+    async fn supports_user_data(&self) -> OpResult<bool> {
+        Ok(false)
+    }
+
     async fn get_info(&self) -> OpResult<VmHostInfo>;
 
     /// List all VMs present on the host, described in host-native terms.
@@ -948,6 +963,7 @@ mod tests {
                 disk_id: 1,
                 mac_address: "ff:ff:ff:ff:ff:fe".to_string(),
                 ssh_host_keys: None,
+                user_data: None,
                 deleted: false,
                 ref_code: None,
                 disabled: false,

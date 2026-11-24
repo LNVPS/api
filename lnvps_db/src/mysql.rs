@@ -2564,7 +2564,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_vm(&self, vm: &Vm) -> DbResult<u64> {
-        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,subscription_line_item_id,ssh_key_id,disk_id,mac_address,ref_code) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
+        Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,subscription_line_item_id,ssh_key_id,disk_id,mac_address,ref_code,user_data) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
             .bind(vm.host_id)
             .bind(vm.user_id)
             .bind(vm.image_id)
@@ -2575,13 +2575,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(vm.disk_id)
             .bind(&vm.mac_address)
             .bind(&vm.ref_code)
+            .bind(&vm.user_data)
             .fetch_one(&self.db)
             .await?
             .try_get(0)?)
     }
 
     async fn insert_vm_with_id(&self, vm: &Vm) -> DbResult<u64> {
-        sqlx::query("insert into vm(id,host_id,user_id,image_id,template_id,custom_template_id,subscription_line_item_id,ssh_key_id,disk_id,mac_address,ref_code) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("insert into vm(id,host_id,user_id,image_id,template_id,custom_template_id,subscription_line_item_id,ssh_key_id,disk_id,mac_address,ref_code,user_data) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(vm.id)
             .bind(vm.host_id)
             .bind(vm.user_id)
@@ -2593,13 +2594,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(vm.disk_id)
             .bind(&vm.mac_address)
             .bind(&vm.ref_code)
+            .bind(&vm.user_data)
             .execute(&self.db)
             .await?;
         Ok(vm.id)
     }
 
     async fn delete_vm(&self, vm_id: u64) -> DbResult<()> {
-        sqlx::query("update vm set deleted = 1, ssh_key_id = null where id = ?")
+        sqlx::query("update vm set deleted = 1, ssh_key_id = null, user_data = case when user_data is null then null else ? end where id = ?")
+            .bind(EncryptedString::new(String::new()))
             .bind(vm_id)
             .execute(&self.db)
             .await?;
@@ -4712,7 +4715,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         // Un-delete any VM linked to this subscription (e.g. auto-cleaned up before
         // payment arrived). This handles payment methods with longer timeouts.
         sqlx::query(
-            "UPDATE vm SET deleted = 0 WHERE subscription_line_item_id IN (SELECT id FROM subscription_line_item WHERE subscription_id = ?)",
+            "UPDATE vm SET user_data = CASE WHEN deleted = 1 THEN NULL ELSE user_data END, deleted = 0 WHERE subscription_line_item_id IN (SELECT id FROM subscription_line_item WHERE subscription_id = ?)",
         )
         .bind(payment.subscription_id)
         .execute(tx.as_mut())
@@ -9644,7 +9647,7 @@ impl AdminDb for LNVpsDbMysql {
         .await?;
 
         // Move VM ownership and drop the old owner's ssh key reference
-        sqlx::query("UPDATE vm SET user_id = ?, ssh_key_id = NULL WHERE id = ?")
+        sqlx::query("UPDATE vm SET user_id = ?, ssh_key_id = NULL, user_data = NULL WHERE id = ?")
             .bind(new_user_id)
             .bind(vm_id)
             .execute(&mut *tx)

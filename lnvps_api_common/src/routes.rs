@@ -174,6 +174,9 @@ impl From<anyhow::Error> for ApiError {
         if let Some(dis) = value.downcast_ref::<crate::DiscountError>() {
             return Self::bad_request(dis);
         }
+        if let Some(error) = value.downcast_ref::<crate::host::UserDataUnsupported>() {
+            return Self::bad_request(error);
+        }
         Self::internal(value)
     }
 }
@@ -275,6 +278,15 @@ mod tests {
         }
         let other = ApiError::from(OpError::Fatal(anyhow::anyhow!("host exploded")));
         assert_eq!(other.code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn unsupported_user_data_maps_to_bad_request_with_message() {
+        let error = ApiError::from(
+            anyhow::Error::new(crate::host::UserDataUnsupported).context("order refused"),
+        );
+        assert_eq!(error.code, StatusCode::BAD_REQUEST);
+        assert_eq!(error.error, "This region's host cannot deliver user_data");
     }
 
     #[test]

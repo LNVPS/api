@@ -252,6 +252,10 @@ impl LibVirtHost {
 
 #[async_trait::async_trait]
 impl VmHostClient for LibVirtHost {
+    async fn supports_user_data(&self) -> OpResult<bool> {
+        Ok(true)
+    }
+
     async fn get_info(&self) -> OpResult<VmHostInfo> {
         self.conn
             .run(|c| {
@@ -1173,6 +1177,37 @@ mod tests {
         let second = LibVirtHost::build_seed_image(&info).map_err(|e| anyhow!("{e:?}"))?;
         assert_ne!(first, second);
         assert!(String::from_utf8_lossy(&second).contains("AAAArotated"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_data_is_supported() -> Result<()> {
+        assert!(host()?.supports_user_data().await?);
+        Ok(())
+    }
+
+    #[test]
+    fn seed_image_carries_script_and_preserves_no_script_document() -> Result<()> {
+        let mut info = vm_info();
+        let original = LibVirtHost::build_seed_image(&info)?;
+        let config = cloud_init::user_data(&info)?;
+        assert!(
+            original
+                .windows(config.len())
+                .any(|bytes| bytes == config.as_bytes())
+        );
+        info.vm.user_data = Some("#!/bin/sh\necho seed-script".into());
+        let scripted = LibVirtHost::build_seed_image(&info)?;
+        let document = cloud_init::user_data(&info)?;
+        assert!(
+            scripted
+                .windows(document.len())
+                .any(|bytes| bytes == document.as_bytes())
+        );
+        assert!(document.contains("Content-Type: text/x-shellscript-per-once; charset=\"utf-8\""));
+        assert!(document.contains("Content-Transfer-Encoding: base64"));
+        info.vm.user_data = None;
+        assert_eq!(original, LibVirtHost::build_seed_image(&info)?);
         Ok(())
     }
 

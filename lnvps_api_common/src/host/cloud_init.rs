@@ -9,9 +9,11 @@
 use crate::host::FullVmInfo;
 use crate::network::parse_gateway;
 use anyhow::Result;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use ipnetwork::IpNetwork;
 use lnvps_db::IpRangeAllocationMode;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::net::IpAddr;
 
 /// DNS resolvers forced into every guest's `/etc/resolv.conf`.
@@ -176,6 +178,10 @@ pub fn meta_data(value: &FullVmInfo) -> Result<String> {
 
 /// NoCloud `user-data` document.
 pub fn user_data(value: &FullVmInfo) -> Result<String> {
+    user_data_with_package_upgrade(value, false)
+}
+
+pub fn user_data_with_package_upgrade(value: &FullVmInfo, package_upgrade: bool) -> Result<String> {
     // NOTE: `EncryptedString`'s Display impl deliberately renders "[ENCRYPTED]"
     // so secrets cannot leak into logs. Using it here would authorise that
     // literal string as the customer's SSH key and lock them out of their VM.
@@ -231,9 +237,53 @@ pub fn user_data(value: &FullVmInfo) -> Result<String> {
         ),
     };
 
+    let mut config = format!("#cloud-config\n{}", serde_yaml_ng::to_string(&data)?);
+    if package_upgrade && value.vm.user_data.is_some() {
+        config.push_str("package_upgrade: true\n");
+    }
+    let Some(script) = &value.vm.user_data else {
+        return Ok(config);
+    };
+    let script = script.as_str();
+    anyhow::ensure!(
+        !script.is_empty(),
+        "VM {} script was cleared when the VM was deleted; the VM cannot be built with it",
+        value.vm.id
+    );
+    let boundary = format!("lnvps-{:x}", Sha256::digest(script.as_bytes()));
+    multipart_user_data(&config, script, &boundary)
+}
+
+fn multipart_user_data(config: &str, script: &str, boundary: &str) -> Result<String> {
+    let delimiter = format!("--{boundary}");
+    for part in [config, script] {
+        anyhow::ensure!(
+            !part
+                .split(['\r', '\n'])
+                .any(|line| line.starts_with(&delimiter)),
+            "Cloud-init MIME boundary occurs inside a part"
+        );
+    }
+    let encode = |part: &str| {
+        let encoded = STANDARD.encode(part.as_bytes());
+        encoded
+            .as_bytes()
+            .chunks(76)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    };
+    let config = encode(config);
+    let script = encode(script);
     Ok(format!(
-        "#cloud-config\n{}",
-        serde_yaml_ng::to_string(&data)?
+        "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\
+         MIME-Version: 1.0\r\n\r\n\
+         --{boundary}\r\nContent-Type: text/cloud-config; charset=\"utf-8\"\r\n\
+         Content-Transfer-Encoding: base64\r\n\r\n\
+         {config}\r\n--{boundary}\r\n\
+         Content-Type: text/x-shellscript-per-once; charset=\"utf-8\"\r\n\
+         Content-Transfer-Encoding: base64\r\n\r\n\
+         {script}\r\n--{boundary}--\r\n"
     ))
 }
 
@@ -420,6 +470,138 @@ mod tests {
         cfg.host.mtu = Some(1280);
         let out = network_config(&cfg)?.yaml;
         assert!(out.contains("    mtu: 1280\n"), "{out}");
+        Ok(())
+    }
+
+    #[test]
+    fn user_data_multipart_preserves_both_payloads() -> Result<()> {
+        let mut cfg = mock_full_vm();
+        use base64::{Engine, engine::general_purpose::STANDARD};
+
+        cfg.ssh_key.key_data = "ssh-ed25519 AAAAtest café ☃".into();
+        let config = user_data(&cfg)?;
+        assert!(config.contains("café ☃"));
+        for script in [
+            "#!/bin/sh\necho café ☃\r\necho done",
+            "#!/bin/sh\r\necho ok\r\n",
+            "#!/bin/sh\necho ok\n\n",
+        ] {
+            cfg.vm.user_data = Some(script.into());
+            let out = user_data(&cfg)?;
+            let boundary = format!("lnvps-{:x}", Sha256::digest(script.as_bytes()));
+            assert!(out.starts_with(&format!(
+                "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\nMIME-Version: 1.0\r\n"
+            )));
+            let parts: Vec<_> = out.split(&format!("\r\n--{boundary}")).collect();
+            assert_eq!(parts.len(), 4);
+            for (part, content_type, expected) in [
+                (parts[1], "text/cloud-config", config.as_bytes()),
+                (parts[2], "text/x-shellscript-per-once", script.as_bytes()),
+            ] {
+                let (headers, payload) = part.split_once("\r\n\r\n").unwrap();
+                assert_eq!(
+                    headers,
+                    format!(
+                        "\r\nContent-Type: {content_type}; charset=\"utf-8\"\r\nContent-Transfer-Encoding: base64"
+                    )
+                );
+                let lines: Vec<_> = payload.split("\r\n").collect();
+                assert!(
+                    lines
+                        .iter()
+                        .all(|line| !line.is_empty() && line.len() <= 76)
+                );
+                assert!(lines[..lines.len() - 1].iter().all(|line| line.len() == 76));
+                assert_eq!(STANDARD.decode(lines.concat())?, expected);
+            }
+            assert_eq!(parts[3], "--\r\n");
+            assert_eq!(out, user_data(&cfg)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn package_upgrade_is_opt_in_and_only_for_scripted_guests() -> Result<()> {
+        let mut cfg = mock_full_vm();
+        assert_eq!(
+            user_data(&cfg)?,
+            user_data_with_package_upgrade(&cfg, true)?
+        );
+        cfg.vm.user_data = Some("#!/bin/sh\necho first-boot".into());
+        let plain = user_data(&cfg)?;
+        let proxmox = user_data_with_package_upgrade(&cfg, true)?;
+        let boundary = format!(
+            "lnvps-{:x}",
+            Sha256::digest(cfg.vm.user_data.as_ref().unwrap().as_str().as_bytes())
+        );
+        let decode = |out: &str| -> Result<String> {
+            let part = out.split(&format!("\r\n--{boundary}")).nth(1).unwrap();
+            let payload = part.split_once("\r\n\r\n").unwrap().1.replace("\r\n", "");
+            Ok(String::from_utf8(STANDARD.decode(payload)?)?)
+        };
+        assert!(!decode(&plain)?.contains("package_upgrade"));
+        assert_eq!(
+            decode(&proxmox)?,
+            format!("{}package_upgrade: true\n", decode(&plain)?)
+        );
+        assert!(!decode(&proxmox)?.contains("chpasswd"));
+        Ok(())
+    }
+
+    #[test]
+    fn user_data_refuses_a_script_cleared_on_deletion() {
+        let mut cfg = mock_full_vm();
+        cfg.vm.user_data = Some("".into());
+        let error = user_data(&cfg).unwrap_err().to_string();
+        assert!(error.contains("script was cleared when the VM was deleted"));
+        assert!(error.contains("cannot be built with it"));
+    }
+
+    #[test]
+    fn multipart_rejects_boundary_in_either_part() {
+        for collision in ["--test", "text\n--test--\n", "text\r\n--test \r\n"] {
+            assert!(multipart_user_data(collision, "#!/bin/sh", "test").is_err());
+            assert!(multipart_user_data("#cloud-config", collision, "test").is_err());
+        }
+        assert!(multipart_user_data("#cloud-config", "#!/bin/sh\necho --test", "test").is_ok());
+    }
+
+    #[test]
+    fn user_data_without_script_golden() -> Result<()> {
+        let mut cfg = mock_full_vm();
+        cfg.image.default_username = Some("debian".to_string());
+        cfg.ssh_key.key_data = "ssh-ed25519 AAAAtest user@host".into();
+        assert_eq!(
+            user_data(&cfg)?,
+            concat!(
+                "#cloud-config\n",
+                "hostname: VM1\n",
+                "preserve_hostname: false\n",
+                "manage_etc_hosts: true\n",
+                "users:\n",
+                "- default\n",
+                "- name: debian\n",
+                "  sudo: ALL=(ALL) NOPASSWD:ALL\n",
+                "  lock_passwd: true\n",
+                "  ssh_authorized_keys:\n",
+                "  - ssh-ed25519 AAAAtest user@host\n",
+                "ssh_authorized_keys:\n",
+                "- ssh-ed25519 AAAAtest user@host\n",
+                "ssh_pwauth: false\n",
+                "disable_root: true\n",
+                "ssh_deletekeys: false\n",
+                "manage_resolv_conf: true\n",
+                "resolv_conf:\n",
+                "  nameservers:\n",
+                "  - 1.1.1.1\n",
+                "  - 8.8.8.8\n",
+                "  - 9.9.9.9\n",
+                "  - 2606:4700:4700::1111\n",
+                "  - 2001:4860:4860::8888\n",
+                "  - 2620:fe::fe\n",
+                "final_message: LNVPS VM1 ready after $UPTIME seconds\n",
+            )
+        );
         Ok(())
     }
 

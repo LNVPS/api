@@ -135,7 +135,7 @@ impl DVMHandler for LnvpsDvm {
 
             let vm = sub_handler
                 .vm_provisioner()
-                .provision_custom(uid, template, image.id, ssh_key_id, None)
+                .provision_custom(uid, template, image.id, ssh_key_id, None, None)
                 .await?;
             let line_item = db
                 .get_subscription_line_item(vm.subscription_line_item_id)

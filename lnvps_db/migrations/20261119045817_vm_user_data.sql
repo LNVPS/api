@@ -1,0 +1,1 @@
+ALTER TABLE vm ADD COLUMN user_data TEXT NULL;

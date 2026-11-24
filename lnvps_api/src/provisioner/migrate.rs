@@ -296,6 +296,18 @@ impl VmProvisioner {
 }
 
 impl VmProvisioner {
+    async fn ensure_migration_user_data(&self, vm: &Vm, target: &VmHost) -> Result<()> {
+        if vm
+            .user_data
+            .as_ref()
+            .is_some_and(|s| !s.as_str().is_empty())
+            && !self.host_client(target).await?.supports_user_data().await?
+        {
+            bail!("Target host {} cannot deliver user_data", target.id);
+        }
+        Ok(())
+    }
+
     /// Migrate a VM to another host.
     ///
     /// `live` attempts an online migration (the VM keeps running); otherwise a
@@ -327,6 +339,7 @@ impl VmProvisioner {
         let capacity = HostCapacityService::new(db.clone())
             .get_host_capacity(&target_host, None, None)
             .await?;
+        self.ensure_migration_user_data(&vm, &target_host).await?;
         let target = plan_migration(
             &resources,
             &source_host,
@@ -616,6 +629,16 @@ impl VmProvisioner {
         }
 
         if drift.is_host_move() {
+            if vm
+                .user_data
+                .as_ref()
+                .is_some_and(|s| !s.as_str().is_empty())
+            {
+                warn!(
+                    "VM {} with user_data was moved externally to host {}; verify that this host can deliver scripts",
+                    drift.vm_id, drift.to_host_id
+                );
+            }
             info!(
                 "VM {} found on host {} but recorded on host {}; updating database",
                 drift.vm_id, drift.to_host_id, drift.from_host_id
@@ -1107,6 +1130,89 @@ mod tests {
         })
         .await
         .expect("vm")
+    }
+
+    #[tokio::test]
+    async fn migrations_check_target_script_capability_before_source_calls_or_writes() {
+        let _serial = serial().await;
+        for script in [None, Some(""), Some("#!/bin/sh\necho once")] {
+            for capability in [0, 1, 2] {
+                let db = Arc::new(MockDb::default());
+                add_second_host(&db).await;
+                let vm_id = add_vm(&db).await;
+                db.vms.lock().await.get_mut(&vm_id).unwrap().user_data = script.map(Into::into);
+                let source = crate::mocks::UserDataHost::new(0);
+                let target = crate::mocks::UserDataHost::new(capability);
+                let source_calls = source.calls.clone();
+                let target_calls = target.calls.clone();
+                let provisioner = VmProvisioner::new(mock_settings(), db.clone())
+                    .with_host_clients(move |h| {
+                        Arc::new(if h.id == 1 {
+                            source.clone()
+                        } else {
+                            target.clone()
+                        })
+                    });
+                let plan = provisioner
+                    .plan_vm_migration(vm_id, 2, &Default::default())
+                    .await
+                    .unwrap();
+                let refused = script.is_some_and(|s| !s.is_empty()) && capability != 1;
+                assert_eq!(plan.allowed(), !refused, "{:?}", plan.refusals);
+                let result = provisioner.migrate_vm(vm_id, 2, false, None).await;
+                if refused {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains(if capability == 0 {
+                        "Target host 2 cannot deliver user_data"
+                    } else {
+                        "capability lookup failed"
+                    }));
+                    assert!(source_calls.lock().unwrap().is_empty());
+                    assert_eq!(db.get_vm(vm_id).await.unwrap().host_id, 1);
+                    assert!(db.list_vm_history(vm_id).await.unwrap().is_empty());
+                } else {
+                    assert_eq!(result.unwrap().host_id, 2);
+                }
+                if script.is_none_or(|s| s.is_empty()) {
+                    assert!(target_calls.lock().unwrap().is_empty());
+                } else {
+                    assert!(
+                        target_calls
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .all(|c| *c == "supports_user_data")
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn host_drift_records_placement_for_script_on_unsupported_target() {
+        let db = Arc::new(MockDb::default());
+        add_second_host(&db).await;
+        let vm_id = add_vm(&db).await;
+        db.vms.lock().await.get_mut(&vm_id).unwrap().user_data = Some("#!/bin/sh".into());
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let drift = VmHostDrift {
+            vm_id,
+            from_host_id: 1,
+            to_host_id: 2,
+            storage: Some("mock-disk-2".into()),
+        };
+        assert!(provisioner.apply_drift(&drift).await.unwrap());
+        let stored = db.get_vm(vm_id).await.unwrap();
+        assert_eq!(stored.host_id, 2);
+        assert_eq!(stored.disk_id, 2);
+        assert_eq!(stored.user_data.unwrap().as_str(), "#!/bin/sh");
+        assert!(
+            db.list_vm_history(vm_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|h| matches!(h.action_type, lnvps_db::VmHistoryActionType::Migrated))
+        );
     }
 
     #[tokio::test]

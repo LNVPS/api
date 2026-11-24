@@ -4,7 +4,7 @@ use russh::client::{self, Handle, Msg};
 use russh::keys::{PrivateKeyWithHashAlg, decode_secret_key, load_secret_key};
 use russh::{Channel, ChannelMsg};
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::FileAttributes;
+use russh_sftp::protocol::{FileAttributes, OpenFlags};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -310,7 +310,26 @@ impl SshClient {
         channel.request_subsystem(true, "sftp").await?;
         let sftp = SftpSession::new(channel.into_stream()).await?;
 
-        let mut file = sftp.create(path.clone()).await?;
+        let mut file = if mode == 0o600 {
+            let file = sftp
+                .open_with_flags_and_attributes(
+                    path.clone(),
+                    OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+                    FileAttributes {
+                        permissions: Some(0o600),
+                        ..FileAttributes::empty()
+                    },
+                )
+                .await?;
+            file.set_metadata(FileAttributes {
+                permissions: Some(0o600),
+                ..FileAttributes::empty()
+            })
+            .await?;
+            file
+        } else {
+            sftp.create(path.clone()).await?
+        };
         file.write_all(local_data).await?;
         file.shutdown().await?;
 

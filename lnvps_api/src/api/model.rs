@@ -21,6 +21,8 @@ pub struct ApiCustomVmOrder {
     pub image_id: u64,
     pub ssh_key_id: u64,
     pub ref_code: Option<String>,
+    #[serde(default)]
+    pub user_data: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -406,6 +408,8 @@ pub struct CreateVmRequest {
     pub image_id: u64,
     pub ssh_key_id: u64,
     pub ref_code: Option<String>,
+    #[serde(default)]
+    pub user_data: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1788,6 +1792,43 @@ pub struct VmTrafficQuery {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn order_user_data_is_optional_and_preserved() {
+        let mut standard = serde_json::json!({"template_id": 1, "image_id": 1, "ssh_key_id": 1});
+        let mut custom = serde_json::json!({
+            "pricing_id": 1, "cpu": 2, "memory": 2147483648_u64, "disk": 21474836480_u64,
+            "disk_type": "ssd", "disk_interface": "pcie", "image_id": 1, "ssh_key_id": 1
+        });
+        assert!(
+            serde_json::from_value::<CreateVmRequest>(standard.clone())
+                .unwrap()
+                .user_data
+                .is_none()
+        );
+        assert!(
+            serde_json::from_value::<ApiCustomVmOrder>(custom.clone())
+                .unwrap()
+                .user_data
+                .is_none()
+        );
+        for value in [&mut standard, &mut custom] {
+            value["user_data"] = "#!/bin/sh\necho order".into();
+        }
+        assert_eq!(
+            serde_json::from_value::<CreateVmRequest>(standard)
+                .unwrap()
+                .user_data
+                .as_deref(),
+            Some("#!/bin/sh\necho order")
+        );
+        assert_eq!(
+            serde_json::from_value::<ApiCustomVmOrder>(custom)
+                .unwrap()
+                .user_data
+                .as_deref(),
+            Some("#!/bin/sh\necho order")
+        );
+    }
 
     #[test]
     fn snapshot_request_description_is_optional() {

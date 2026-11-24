@@ -344,6 +344,7 @@ async fn the_probe_vm_is_addressed_as_the_node_expects() -> Result<()> {
 
     let info = spec.vm_info();
     assert_eq!(info.vm.mac_address, probe_mac(node.id));
+    assert!(info.vm.user_data.is_none());
     assert_eq!(info.ips.len(), 1);
     // Bare, as the database stores it: the cloud-init renderer parses this as
     // an address and silently drops anything carrying a prefix, which boots a

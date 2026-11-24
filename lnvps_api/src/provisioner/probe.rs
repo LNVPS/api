@@ -265,6 +265,7 @@ impl ProbeSpec {
                 template_id: Some(self.template.id),
                 disk_id: 0,
                 mac_address: probe_mac(self.node_id),
+                user_data: None,
                 ..Default::default()
             },
             host: self.host.clone(),
