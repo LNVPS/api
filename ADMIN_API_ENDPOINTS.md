@@ -4154,6 +4154,74 @@ Response:
 **Asynchronous Processing:** This endpoint dispatches an `UnassignVmIp` work job for distributed processing. The
 operation returns immediately with a job ID.
 
+### VM Extra Allowed IPs
+
+Addresses a VM may send from in addition to its own assigned IPs, for a floating address that moves between VMs (a
+MetalLB or keepalived VIP). On Proxmox hosts with the firewall on, each entry is added to the VM's `ipfilter-net0`
+set with its comment, and the worker's firewall sync (`PatchHosts`, `ApplyVmFirewall`) keeps it there. Entries are
+admin only and never shown to the customer. They carry no billing, DNS or ARP.
+
+#### List Extra Allowed IPs
+
+```
+GET /api/admin/v1/vms/{id}/extra_allowed_ips
+```
+
+Required Permission: `virtual_machines::view`
+
+Response:
+
+```json
+{
+  "data": [
+    {
+      "id": 1,
+      "vm_id": 2069,
+      "ip": "185.18.221.135",
+      "comment": "k8s ingress VIP",
+      "created": "2026-11-24T15:30:00Z"
+    }
+  ]
+}
+```
+
+#### Add Extra Allowed IP
+
+```
+POST /api/admin/v1/vms/{id}/extra_allowed_ips
+```
+
+Required Permission: `virtual_machines::update`
+
+Body:
+
+```json
+{
+  "ip": "185.18.221.135",
+  "comment": "k8s ingress VIP"
+}
+```
+
+- `ip`: one literal IPv4 or IPv6 address. `/32` and `/128` are accepted and dropped; any other prefix is refused (400).
+  The address is stored in canonical form.
+- `comment`: required, one line, at most 200 characters. It is the comment shown on the Proxmox ipset entry.
+
+Refused with 409 when the address is assigned (`vm_ip_assignment`, not deleted) to a VM of a different user, when it
+is already on this VM's list, or when the VM is deleted. An address assigned to another VM of the same user is
+allowed: that is the floating VIP case. The change is written to the audit log (`admin.vm.extra_ip.add`) and an
+`ApplyVmFirewall` job is queued. Returns the new entry.
+
+#### Remove Extra Allowed IP
+
+```
+DELETE /api/admin/v1/vms/{id}/extra_allowed_ips/{entry_id}
+```
+
+Required Permission: `virtual_machines::update`
+
+Deletes the entry (404 when it does not belong to this VM), writes `admin.vm.extra_ip.remove` to the audit log and
+queues `ApplyVmFirewall`, which removes the address from the ipset.
+
 ### Work Job Feedback System
 
 Many admin endpoints now dispatch work jobs for asynchronous processing instead of blocking operations. This provides
