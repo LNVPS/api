@@ -128,3 +128,37 @@ impl NotificationChannel for EmailChannel {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn channel() -> EmailChannel {
+        EmailChannel::new(SmtpConfig {
+            admin: None,
+            server: "smtp.example.com:587".to_string(),
+            from: None,
+            username: "u".to_string(),
+            password: "p".to_string(),
+        })
+    }
+
+    #[test]
+    fn wants_ignores_verification_and_skips_users_without_email() {
+        let ch = channel();
+        let mut user = User {
+            contact_email: true,
+            email: "a@example.com".to_string().into(),
+            email_verified: false,
+            ..Default::default()
+        };
+        assert!(ch.wants(&user));
+        user.email_verified = true;
+        assert!(ch.wants(&user));
+        user.contact_email = false;
+        assert!(!ch.wants(&user));
+        user.contact_email = true;
+        user.email = String::new().into();
+        assert!(!ch.wants(&user));
+    }
+}

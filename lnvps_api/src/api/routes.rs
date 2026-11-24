@@ -4028,6 +4028,142 @@ mod tests {
         .unwrap()
     }
 
+    async fn smtp_state_with_user(
+        seed: u8,
+        email: &str,
+        verified: bool,
+    ) -> (Arc<lnvps_api_common::MockDb>, RouterState, u64, u64) {
+        let db = Arc::new(lnvps_api_common::MockDb::default());
+        let mut state = mock_router_state(db.clone()).await;
+        state.settings.smtp = Some(crate::settings::SmtpConfig {
+            admin: None,
+            server: "smtp.example.com:587".to_string(),
+            from: None,
+            username: "u".to_string(),
+            password: "p".to_string(),
+        });
+        let uid = db.upsert_user(&nostr_auth(seed).pubkey()).await.unwrap();
+        let mut user = db.get_user(uid).await.unwrap();
+        user.email = email.to_string().into();
+        user.email_verified = verified;
+        db.update_user(&user).await.unwrap();
+        let key = db
+            .insert_user_ssh_key(&lnvps_db::UserSshKey {
+                id: 0,
+                name: "k".to_string(),
+                user_id: uid,
+                created: Default::default(),
+                key_data: "ssh-rsa AAA==".into(),
+            })
+            .await
+            .unwrap();
+        (db, state, uid, key)
+    }
+
+    async fn order_template_vm(seed: u8, email: &str, verified: bool) {
+        let (db, state, uid, key) = smtp_state_with_user(seed, email, verified).await;
+        let rsp = v1_create_vm_order(
+            nostr_auth(seed),
+            ClientIp(None),
+            State(state),
+            Json(CreateVmRequest {
+                template_id: 1,
+                image_id: 1,
+                ssh_key_id: key,
+                ref_code: None,
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("order refused: {}", e.error));
+        assert_eq!(db.get_vm(rsp.0.data.id).await.unwrap().user_id, uid);
+    }
+
+    async fn order_custom_vm(seed: u8, email: &str, verified: bool) {
+        let (db, state, uid, key) = smtp_state_with_user(seed, email, verified).await;
+        let pricing_id = 77;
+        db.custom_pricing.lock().await.insert(
+            pricing_id,
+            lnvps_db::VmCustomPricing {
+                id: pricing_id,
+                name: "p".to_string(),
+                enabled: true,
+                region_id: 1,
+                currency: "EUR".to_string(),
+                cpu_cost: 100,
+                memory_cost: 50,
+                ip4_cost: 150,
+                ip6_cost: 5,
+                min_cpu: 1,
+                max_cpu: 32,
+                min_memory: 1024 * 1024 * 1024,
+                max_memory: 128 * 1024 * 1024 * 1024,
+                min_ip4: 1,
+                max_ip4: 1,
+                min_ip6: 1,
+                max_ip6: 1,
+                ..Default::default()
+            },
+        );
+        db.custom_pricing_disk.lock().await.insert(
+            pricing_id,
+            lnvps_db::VmCustomPricingDisk {
+                id: pricing_id,
+                pricing_id,
+                kind: lnvps_db::DiskType::SSD,
+                interface: lnvps_db::DiskInterface::PCIe,
+                cost: 5,
+                min_disk_size: 1024 * 1024 * 1024,
+                max_disk_size: 10 * 1024 * 1024 * 1024 * 1024,
+            },
+        );
+        let rsp = v1_create_custom_vm_order(
+            nostr_auth(seed),
+            ClientIp(None),
+            State(state),
+            Json(ApiCustomVmOrder {
+                spec: ApiCustomVmRequest {
+                    pricing_id,
+                    cpu: 2,
+                    memory: 4 * 1024 * 1024 * 1024,
+                    disk: 50 * 1024 * 1024 * 1024,
+                    disk_type: lnvps_api_common::ApiDiskType::SSD,
+                    disk_interface: lnvps_api_common::ApiDiskInterface::PCIe,
+                    cpu_mfg: None,
+                    cpu_arch: None,
+                    cpu_feature: vec![],
+                    ip4_count: 1,
+                    ip6_count: 1,
+                    transfer_gb: None,
+                    network_mbps: None,
+                },
+                image_id: 1,
+                ssh_key_id: key,
+                ref_code: None,
+            }),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("order refused: {}", e.error));
+        assert_eq!(db.get_vm(rsp.0.data.id).await.unwrap().user_id, uid);
+    }
+
+    #[tokio::test]
+    async fn an_unverified_email_does_not_block_a_vm_order() {
+        order_template_vm(31, "a@example.com", false).await;
+        order_custom_vm(32, "a@example.com", false).await;
+    }
+
+    #[tokio::test]
+    async fn a_verified_email_can_order_a_vm() {
+        order_template_vm(33, "b@example.com", true).await;
+        order_custom_vm(34, "b@example.com", true).await;
+    }
+
+    #[tokio::test]
+    async fn no_email_does_not_block_a_vm_order() {
+        order_template_vm(35, "", false).await;
+        order_custom_vm(36, "", false).await;
+    }
+
     #[tokio::test]
     async fn deleting_a_gateway_saved_method_removes_it_at_the_gateway_first() {
         use lnvps_api_common::{FakeGateway, MockDb};
