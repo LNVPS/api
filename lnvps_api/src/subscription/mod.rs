@@ -46,6 +46,8 @@ mod app;
 mod crypto;
 mod gateway_card;
 #[cfg(test)]
+mod gateway_contract_tests;
+#[cfg(test)]
 mod gateway_crypto_tests;
 #[cfg(test)]
 mod gateway_row_tests;

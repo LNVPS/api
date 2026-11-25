@@ -11,7 +11,7 @@ mod legal;
 // both ends actually use: serialising this type and parsing the node's is the
 // only thing that proves the two agree.
 pub mod marketplace;
-mod model;
+pub(crate) mod model;
 #[cfg(feature = "nostr-domain")]
 mod nostr_domain;
 mod oauth;
