@@ -3673,6 +3673,7 @@ dependencies = [
  "tower",
  "tower-http",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

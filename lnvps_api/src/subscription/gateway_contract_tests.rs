@@ -344,9 +344,13 @@ async fn onchain_seen_unconfirmed_shows_the_outpoint_like_in_process() {
 #[tokio::test]
 async fn fixedfloat_seen_unconfirmed_shows_the_outpoint_like_in_process() {
     let w = world(true).await;
-    let (before, payment) = customer_json(&w, PaymentMethod::FixedFloat, RenewMode::FixedFloat {
-        coin: Currency::XMR,
-    })
+    let (before, payment) = customer_json(
+        &w,
+        PaymentMethod::FixedFloat,
+        RenewMode::FixedFloat {
+            coin: Currency::XMR,
+        },
+    )
     .await
     .unwrap();
     assert!(before["data"]["fixedfloat"].get("outpoint").is_none());

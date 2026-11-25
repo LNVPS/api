@@ -212,6 +212,8 @@ pub trait PaymentGateway: Send + Sync {
 
 pub struct GatewayClient {
     client: Gateway,
+    base_url: String,
+    api_key: String,
 }
 
 impl GatewayClient {
@@ -222,7 +224,24 @@ impl GatewayClient {
     pub fn from_parts(url: &str, api_key: &str) -> Self {
         Self {
             client: Gateway::new(url, api_key),
+            base_url: url.trim_end_matches('/').to_string(),
+            api_key: api_key.to_string(),
         }
+    }
+
+    pub async fn customer_receipts_enabled(&self) -> Result<bool> {
+        let project: serde_json::Value = reqwest::Client::new()
+            .get(format!("{}/v1/project", self.base_url))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        Ok(project
+            .get("customer_receipts")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true))
     }
 
     pub async fn check(&self) -> Result<usize> {
@@ -783,6 +802,61 @@ mod tests {
         assert!(is_gateway_payment(Some("pgw:abc")));
         assert!(!is_gateway_payment(Some("abc")));
         assert!(!is_gateway_payment(None));
+    }
+
+    #[tokio::test]
+    async fn receipts_check_reads_the_project_switch() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for (on, expected) in [(false, false), (true, true)] {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v1/project"))
+                .and(header("authorization", "Bearer k"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"id": 1, "name": "lnvps", "customer_receipts": on}),
+                ))
+                .mount(&server)
+                .await;
+            let client = GatewayClient::from_parts(&server.uri(), "k");
+            assert_eq!(client.customer_receipts_enabled().await.unwrap(), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_card_attempt_sends_no_customer_email() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/payments"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = GatewayClient::from_parts(&server.uri(), "k");
+        let _ = client
+            .create_card_attempt(GatewayCardRequest {
+                payment_id: vec![1; 32],
+                provider: GatewayCardProvider::Stripe,
+                amount: 100,
+                currency: "EUR".into(),
+                tax: 0,
+                description: "d".into(),
+                expires_in_secs: 600,
+                customer_ref: "7".into(),
+                customer_email: Some("a@b.c".into()),
+                save_card: false,
+                success_url: None,
+                cancel_url: None,
+                metadata: serde_json::json!({}),
+            })
+            .await;
+        let requests = server.received_requests().await.unwrap();
+        assert!(!requests.is_empty());
+        for r in requests {
+            let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+            assert!(body.get("customer_email").map_or(true, |v| v.is_null()));
+        }
     }
 
     #[tokio::test]

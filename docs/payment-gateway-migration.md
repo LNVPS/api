@@ -47,7 +47,7 @@ The gateway `checkout_url` is dropped when the attempt is stored. It is never pu
 - Payment ids are random 32 bytes created by LNVPS and sent as the gateway `reference`. The `pgw:` `external_id` is internal and never serialised. OK.
 - Expiry: Lightning 600 s, on-chain 3600 s, FixedFloat 1800 s are sent as `expires_in` and the LNVPS row keeps its own clock. Card payments now use 3600 s, the same as the in process Revolut order. OK.
 - Status polling reads the LNVPS row, settled by the signed webhook. The client polls the same endpoints. OK.
-- "Payment received, waiting for confirmation": the in process path sets `outpoint` at the first mempool sighting. A gateway on-chain payment has no LNVPS outpoint until the gateway reports it. OPEN: the gateway client at 64b456d exposes neither the seen-but-unconfirmed state (`progress` and receipts exist only on the public pay page, not on `Attempt`) nor an `attempt.received` webhook, so a 0-conf gateway deposit shows no outpoint until `payment.paid`. Filed as LNVPS issue 1433 (to move to payment-gateway, priority 40). The ignored test `onchain_seen_unconfirmed_shows_the_outpoint_like_in_process` names it. FixedFloat has the same gap.
+- "Payment received, waiting for confirmation": the in process path sets `outpoint` at the first mempool sighting. A gateway on-chain or FixedFloat payment shows the same state: the gateway sends `attempt.received` (client rev 2098035) with the txid and reference, `handle_attempt_received` stores it under `gateway_deposit` in the payment `metadata`, and `deposit_outpoint` returns it as `outpoint`. The payment stays unpaid until `payment.paid`. Replays change nothing. Covered by `onchain_seen_unconfirmed_shows_the_outpoint_like_in_process` and the FixedFloat twin. OK.
 
 ### c. Save card and saved card list
 
@@ -58,7 +58,7 @@ The gateway `checkout_url` is dropped when the attempt is stored. It is never pu
 ### d. Receipts and emails
 
 - Line items: card attempts send one line item carrying the net amount and the tax amount, so the gateway total equals the charge and the tax matches the frozen LNVPS breakdown. Per subscription line items stay stage 3 work. The LNVPS invoice remains the receipt customers get.
-- Gateway emails: the only customer facing mail in the gateway is `send_receipt_mail`, which needs `customer_email` on the payment. At the pinned revision nothing calls it, and LNVPS sends `customer_email` only on a save card attempt (Revolut needs it to create the customer), never on a plain payment. Plain card, Lightning, on-chain and FixedFloat payments carry no email. OPEN: a per-project switch to turn customer receipt email off is filed as LNVPS issue 1434 (to move to payment-gateway, priority 45). Until it ships, the sandbox run must confirm no mail and that Stripe does not send its own receipt (an account setting on the Stripe side).
+- Gateway emails: the only customer facing mail in the gateway is `send_receipt_mail`, which needs `customer_email` on the payment. At the pinned revision nothing calls it, and LNVPS sends `customer_email` only on a save card attempt (Revolut needs it to create the customer), never on a plain payment. Plain card, Lightning, on-chain and FixedFloat payments carry no email. The gateway project setting `customer_receipts` must be off for the LNVPS project, which turns off every email the gateway sends to customers (owner notifications are unaffected). Turn it off in the gateway console project settings, or `POST /console/api/projects/{id}/settings` with `customer_receipts: false`. The admin `POST /api/admin/v1/payment_methods/<id>/gateway/test` reads `GET /v1/project` and fails while `customer_receipts` is still on, and `plain_card_attempt_sends_no_customer_email` pins that a plain card attempt sends no `customer_email`. Stripe's own receipt is an account setting on the Stripe side, to confirm in the sandbox run.
 - Operator emails (webhook abandoned, refund failed, provider failing) go to tenant owners only.
 
 ### e. Failure messages
@@ -77,9 +77,8 @@ Card attempts set `success_url` and `cancel_url` to the LNVPS `public-url`. The 
 ### Open items
 
 1. Sandbox run against the sandbox gateway: not done, no sandbox key exists yet. Steps: enable a gateway row for revolut and stripe, buy with each, check the widget opens, the `external_id` starts `pgw:`, no email arrives from the gateway, the webhook settles once.
-2. Mirror gateway on-chain and FixedFloat progress into `outpoint`: blocked on 1433.
-3. Customer receipt email switch: blocked on 1434.
-4. Add the LNVPS origin to the gateway project allowed origins (owner, on the gateway project).
+2. Turn `customer_receipts` off on the gateway project for LNVPS (owner, gateway console), then run the gateway test on the row until it passes.
+3. Add the LNVPS origin to the gateway project allowed origins (owner, on the gateway project).
 
 ## Stages
 

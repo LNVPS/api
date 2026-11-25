@@ -59,9 +59,19 @@ async fn admin_test_gateway(
     let gw = gateway_row_of(&config)?;
     let client = lnvps_api_common::GatewayClient::from_parts(&gw.url, &gw.api_key);
     let result = match client.check().await {
-        Ok(n) => GatewayTestResult {
-            ok: true,
-            message: format!("Connected, the gateway lists {n} payment methods"),
+        Ok(n) => match client.customer_receipts_enabled().await {
+            Ok(false) => GatewayTestResult {
+                ok: true,
+                message: format!("Connected, the gateway lists {n} payment methods"),
+            },
+            Ok(true) => GatewayTestResult {
+                ok: false,
+                message: "The gateway project still emails customer receipts, turn them off in the project settings".to_string(),
+            },
+            Err(e) => GatewayTestResult {
+                ok: false,
+                message: format!("Could not read the gateway project settings: {e}"),
+            },
         },
         Err(e) => GatewayTestResult {
             ok: false,
@@ -771,5 +781,52 @@ mod tests {
 
         assert!(!res.ok);
         assert!(res.message.starts_with("Could not reach the gateway"));
+    }
+
+    async fn test_against_project(receipts: bool) -> GatewayTestResult {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/methods"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/project"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"id": 1, "name": "lnvps", "customer_receipts": receipts}),
+            ))
+            .mount(&server)
+            .await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let mut req = gateway_request(1, false);
+        if let ProviderConfig::Gateway(g) = &mut req.config {
+            g.url = server.uri();
+        }
+        let id = admin_create_payment_method(auth(), State(state(&db)), Json(req))
+            .await
+            .unwrap()
+            .0
+            .data
+            .id;
+        admin_test_gateway(auth(), State(state(&db)), Path(id))
+            .await
+            .unwrap()
+            .0
+            .data
+    }
+
+    #[tokio::test]
+    async fn gateway_test_fails_while_the_project_emails_customers() {
+        let res = test_against_project(true).await;
+        assert!(!res.ok);
+        assert!(res.message.contains("customer receipts"));
+    }
+
+    #[tokio::test]
+    async fn gateway_test_passes_when_customer_receipts_are_off() {
+        let res = test_against_project(false).await;
+        assert!(res.ok, "{}", res.message);
     }
 }
