@@ -303,3 +303,14 @@ async fn customer_text_never_names_the_gateway() {
         assert!(!text.contains("payment-gateway"));
     }
 }
+
+#[tokio::test]
+#[ignore = "needs an attempt.received event or Attempt.receipts from the gateway, LNVPS issue 1433"]
+async fn onchain_seen_unconfirmed_shows_the_outpoint_like_in_process() {
+    let w = world(true).await;
+    let (json, payment) = customer_json(&w, PaymentMethod::OnChain, RenewMode::default())
+        .await
+        .unwrap();
+    assert!(!payment.is_paid);
+    assert!(json["data"]["onchain"].get("outpoint").is_some());
+}
