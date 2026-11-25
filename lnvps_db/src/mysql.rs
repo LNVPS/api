@@ -964,6 +964,244 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(res.rows_affected())
     }
 
+    async fn insert_sanctions_list(&self, list: &crate::SanctionsList) -> DbResult<u64> {
+        let res = sqlx::query(
+            "insert into sanctions_list (source, version, sha256, entry_count, entries, fetched, checked) values (?, ?, ?, ?, ?, ?, ?) returning id",
+        )
+        .bind(&list.source)
+        .bind(&list.version)
+        .bind(&list.sha256)
+        .bind(list.entry_count)
+        .bind(&list.entries)
+        .bind(list.fetched)
+        .bind(list.checked)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn get_sanctions_list(&self, id: u64) -> DbResult<crate::SanctionsList> {
+        Ok(sqlx::query_as("select * from sanctions_list where id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn list_sanctions_lists(&self) -> DbResult<Vec<crate::SanctionsListInfo>> {
+        Ok(sqlx::query_as(
+            "select l.id, l.source, l.version, l.sha256, l.entry_count, l.fetched, l.checked from sanctions_list l where l.id = (select max(i.id) from sanctions_list i where i.source = l.source) order by l.source",
+        )
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn touch_sanctions_list(&self, id: u64) -> DbResult<()> {
+        sqlx::query("update sanctions_list set checked = NOW() where id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn prune_sanctions_lists(&self, source: &str, keep: u64) -> DbResult<u64> {
+        let ids: Vec<u64> = sqlx::query_scalar(
+            "select id from sanctions_list where source = ? order by id desc limit 18446744073709551615 offset ?",
+        )
+        .bind(source)
+        .bind(keep)
+        .fetch_all(&self.db)
+        .await?;
+        let mut removed = 0;
+        for id in ids {
+            removed += sqlx::query("delete from sanctions_list where id = ?")
+                .bind(id)
+                .execute(&self.db)
+                .await?
+                .rows_affected();
+        }
+        Ok(removed)
+    }
+
+    async fn insert_sanctions_match(&self, m: &crate::SanctionsMatch) -> DbResult<Option<u64>> {
+        let res = sqlx::query(
+            "insert ignore into sanctions_match (subject, user_id, payment_ref, field, subject_value, subject_hash, list_id, list_source, list_version, list_fetched, entry_id, entry_name, score, status) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(m.subject)
+        .bind(m.user_id)
+        .bind(&m.payment_ref)
+        .bind(m.field)
+        .bind(&m.subject_value)
+        .bind(&m.subject_hash)
+        .bind(m.list_id)
+        .bind(&m.list_source)
+        .bind(&m.list_version)
+        .bind(m.list_fetched)
+        .bind(&m.entry_id)
+        .bind(&m.entry_name)
+        .bind(m.score)
+        .bind(m.status)
+        .execute(&self.db)
+        .await?;
+        Ok((res.rows_affected() > 0).then(|| res.last_insert_id()))
+    }
+
+    async fn get_sanctions_match(&self, id: u64) -> DbResult<crate::SanctionsMatch> {
+        Ok(sqlx::query_as("select * from sanctions_match where id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn list_sanctions_matches(
+        &self,
+        filter: &crate::SanctionsMatchFilter,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<crate::SanctionsMatch>, u64)> {
+        let clause = "from sanctions_match where (? is null or status = ?) and (? is null or (status in (0, 1)) = ?) and (? is null or user_id = ?) and (? is null or payment_ref = ?)";
+        let status = filter.status;
+        let rows = sqlx::query_as(&format!(
+            "select * {clause} order by id desc limit ? offset ?"
+        ))
+        .bind(status)
+        .bind(status)
+        .bind(filter.open)
+        .bind(filter.open)
+        .bind(filter.user_id)
+        .bind(filter.user_id)
+        .bind(&filter.payment_ref)
+        .bind(&filter.payment_ref)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 = sqlx::query_scalar(&format!("select count(*) {clause}"))
+            .bind(status)
+            .bind(status)
+            .bind(filter.open)
+            .bind(filter.open)
+            .bind(filter.user_id)
+            .bind(filter.user_id)
+            .bind(&filter.payment_ref)
+            .bind(&filter.payment_ref)
+            .fetch_one(&self.db)
+            .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn resolve_sanctions_match(
+        &self,
+        id: u64,
+        status: crate::SanctionsMatchStatus,
+        admin_id: u64,
+        reason: &str,
+    ) -> DbResult<bool> {
+        let res = sqlx::query(
+            "update sanctions_match set status = ?, resolved_by = ?, resolved_at = NOW(), resolution_reason = ? where id = ? and status in (0, 1)",
+        )
+        .bind(status)
+        .bind(admin_id)
+        .bind(reason)
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn insert_payment_screening(&self, s: &crate::PaymentScreening) -> DbResult<bool> {
+        let res = sqlx::query(
+            "insert ignore into payment_screening (payment_ref, payment_id, user_id, payment_method, mode, provider, result, held, sources, address, amount_msat) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&s.payment_ref)
+        .bind(&s.payment_id)
+        .bind(s.user_id)
+        .bind(s.payment_method)
+        .bind(s.mode)
+        .bind(&s.provider)
+        .bind(&s.result)
+        .bind(s.held)
+        .bind(&s.sources)
+        .bind(&s.address)
+        .bind(s.amount_msat)
+        .execute(&self.db)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn get_payment_screening(
+        &self,
+        payment_ref: &str,
+    ) -> DbResult<Option<crate::PaymentScreening>> {
+        Ok(
+            sqlx::query_as("select * from payment_screening where payment_ref = ?")
+                .bind(payment_ref)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn update_payment_screening(&self, s: &crate::PaymentScreening) -> DbResult<()> {
+        sqlx::query(
+            "update payment_screening set payment_id = ?, user_id = ?, payment_method = ?, mode = ?, provider = ?, result = ?, held = ?, sources = ?, address = ?, amount_msat = ? where payment_ref = ?",
+        )
+        .bind(&s.payment_id)
+        .bind(s.user_id)
+        .bind(s.payment_method)
+        .bind(s.mode)
+        .bind(&s.provider)
+        .bind(&s.result)
+        .bind(s.held)
+        .bind(&s.sources)
+        .bind(&s.address)
+        .bind(s.amount_msat)
+        .bind(&s.payment_ref)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_payment_screenings(
+        &self,
+        filter: &crate::PaymentScreeningFilter,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<crate::PaymentScreening>, u64)> {
+        let clause = "from payment_screening where (? is null or payment_id = ?) and (? is null or user_id = ?) and (? is null or (held = 1 and released_at is null) = ?)";
+        let rows = sqlx::query_as(&format!(
+            "select * {clause} order by id desc limit ? offset ?"
+        ))
+        .bind(&filter.payment_id)
+        .bind(&filter.payment_id)
+        .bind(filter.user_id)
+        .bind(filter.user_id)
+        .bind(filter.held)
+        .bind(filter.held)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 = sqlx::query_scalar(&format!("select count(*) {clause}"))
+            .bind(&filter.payment_id)
+            .bind(&filter.payment_id)
+            .bind(filter.user_id)
+            .bind(filter.user_id)
+            .bind(filter.held)
+            .bind(filter.held)
+            .fetch_one(&self.db)
+            .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn release_payment_screening(&self, payment_ref: &str) -> DbResult<bool> {
+        let res = sqlx::query(
+            "update payment_screening set released_at = NOW() where payment_ref = ? and held = 1 and released_at is null",
+        )
+        .bind(payment_ref)
+        .execute(&self.db)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     async fn list_users(&self) -> DbResult<Vec<User>> {
         Ok(sqlx::query_as("select * from users")
             .fetch_all(&self.db)

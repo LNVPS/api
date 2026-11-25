@@ -1355,6 +1355,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "csv"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52cd9d68cf7efc6ddfaaee42e7288d3a99d613d4b50f76ce9827ae0c6e14f938"
+dependencies = [
+ "csv-core",
+ "itoa",
+ "ryu",
+ "serde_core",
+]
+
+[[package]]
+name = "csv-core"
+version = "0.1.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704a3c26996a80471189265814dbc2c257598b96b8a7feae2d31ace646bb9782"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "ctr"
 version = "0.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3664,7 +3685,9 @@ dependencies = [
  "base64 0.22.1",
  "cel",
  "chrono",
+ "csv",
  "env_logger",
+ "flate2",
  "futures",
  "hex",
  "hmac 0.12.1",
@@ -3680,6 +3703,7 @@ dependencies = [
  "rand 0.10.1",
  "rand 0.9.4",
  "redis",
+ "regex",
  "reqwest 0.13.4",
  "russh",
  "russh-sftp",
@@ -3690,11 +3714,13 @@ dependencies = [
  "sha1 0.10.6",
  "sha2 0.10.9",
  "sqlx",
+ "strsim",
  "tempfile",
  "tokio",
  "tokio-tungstenite 0.28.0",
  "tower",
  "try-procedure",
+ "unicode-normalization",
  "urlencoding",
  "uuid",
  "virt",
