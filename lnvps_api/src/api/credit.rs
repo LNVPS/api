@@ -143,7 +143,7 @@ impl ApiCreditTopup {
                 "onchain",
                 ApiPaymentData::OnChain {
                     address: t.external_data.clone(),
-                    outpoint: lnvps_api_common::deposit_outpoint(&t.external_id),
+                    outpoint: lnvps_api_common::deposit_outpoint(&t.external_id, None),
                 },
                 None,
             ),
@@ -154,7 +154,7 @@ impl ApiCreditTopup {
                         coin: d.coin,
                         address: d.deposit_address,
                         amount: d.deposit_amount,
-                        outpoint: lnvps_api_common::deposit_outpoint(&t.external_id),
+                        outpoint: lnvps_api_common::deposit_outpoint(&t.external_id, None),
                     })
                     .unwrap_or(ApiPaymentData::Lightning(String::new())),
                 None,

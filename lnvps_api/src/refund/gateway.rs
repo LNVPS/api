@@ -382,6 +382,7 @@ mod tests {
             refund_id: Some(1),
             amount: Some(outcome.booked_amount),
             reason: None,
+            deposit: None,
         };
         for _ in 0..2 {
             assert_eq!(

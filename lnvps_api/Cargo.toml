@@ -92,7 +92,7 @@ tower-http.workspace = true
 hex.workspace = true
 async-trait.workspace = true
 payments-rs.workspace = true
-payment-gateway-client = { git = "https://github.com/v0l/payment-gateway", rev = "64b456d7129092714143880713361a36f37be275" }
+payment-gateway-client = { git = "https://github.com/v0l/payment-gateway", rev = "209803511d765ff162d6704dffc33bd36542aaab" }
 ipnetwork.workspace = true
 futures.workspace = true
 

@@ -3,7 +3,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use lnvps_api_common::{
-    GatewayEvent, GatewayInvoice, GatewayInvoiceRequest, PaymentGateway, RefundEvidence, WorkJob,
+    GatewayEvent, GATEWAY_DEPOSIT_KEY, GatewayInvoice, GatewayInvoiceRequest, PaymentGateway, RefundEvidence, WorkJob,
     build_refund_row, is_gateway_payment, refundable_remaining,
 };
 use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment, SubscriptionPaymentType};
@@ -70,6 +70,33 @@ async fn find_gateway_payment(
     let id = hex::decode(reference).ok()?;
     let payment = db.get_subscription_payment(&id).await.ok()?;
     is_gateway_payment(payment.external_id.as_deref()).then_some(payment)
+}
+
+async fn handle_attempt_received(
+    db: &Arc<dyn LNVpsDb>,
+    event: &GatewayEvent,
+) -> Result<GatewayEventOutcome> {
+    let Some(deposit) = event.deposit.as_deref() else {
+        return Ok(GatewayEventOutcome::Ignored);
+    };
+    let Some(mut payment) = find_gateway_payment(db, &event.reference).await else {
+        return Ok(GatewayEventOutcome::UnknownPayment);
+    };
+    if payment.is_paid {
+        return Ok(GatewayEventOutcome::AlreadySettled);
+    }
+    let mut metadata = match payment.metadata.take() {
+        Some(serde_json::Value::Object(m)) => m,
+        _ => serde_json::Map::new(),
+    };
+    if metadata.get(GATEWAY_DEPOSIT_KEY).and_then(|v| v.as_str()) == Some(deposit) {
+        payment.metadata = Some(serde_json::Value::Object(metadata));
+        return Ok(GatewayEventOutcome::Ignored);
+    }
+    metadata.insert(GATEWAY_DEPOSIT_KEY.into(), deposit.into());
+    payment.metadata = Some(serde_json::Value::Object(metadata));
+    db.update_subscription_payment(&payment).await?;
+    Ok(GatewayEventOutcome::Ignored)
 }
 
 async fn handle_attempt_failed(
@@ -201,6 +228,7 @@ pub async fn handle_gateway_event(
     match event.kind.as_str() {
         "payment.paid" => {}
         "attempt.failed" => return handle_attempt_failed(db, sub_handler, event).await,
+        "attempt.received" => return handle_attempt_received(db, event).await,
         "refund.completed" => return handle_refund_completed(db, event).await,
         "payment.expired" | "payment.cancelled" => {
             info!("Gateway reports payment {} {}", event.reference, event.kind);

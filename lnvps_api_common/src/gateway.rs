@@ -165,7 +165,10 @@ pub struct GatewayEvent {
     pub refund_id: Option<u64>,
     pub amount: Option<u64>,
     pub reason: Option<String>,
+    pub deposit: Option<String>,
 }
+
+pub const GATEWAY_DEPOSIT_KEY: &str = "gateway_deposit";
 
 #[async_trait]
 pub trait PaymentGateway: Send + Sync {
@@ -491,10 +494,17 @@ pub fn is_gateway_payment(external_id: Option<&str>) -> bool {
     external_id.is_some_and(|e| e.starts_with(GATEWAY_EXTERNAL_ID_PREFIX))
 }
 
-pub fn deposit_outpoint(external_id: &Option<String>) -> Option<String> {
-    external_id
-        .clone()
-        .filter(|e| !is_gateway_payment(Some(e.as_str())))
+pub fn deposit_outpoint(
+    external_id: &Option<String>,
+    metadata: Option<&serde_json::Value>,
+) -> Option<String> {
+    match external_id {
+        Some(e) if is_gateway_payment(Some(e.as_str())) => metadata
+            .and_then(|m| m.get(GATEWAY_DEPOSIT_KEY))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        other => other.clone(),
+    }
 }
 
 pub fn parse_gateway_event(
@@ -535,6 +545,11 @@ pub fn parse_gateway_event_with(
             .and_then(|v| v.as_u64()),
         reason: detail
             .and_then(|d| d.get("reason"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        deposit: (value.get("type").and_then(|t| t.as_str()) == Some("attempt.received"))
+            .then(|| detail.and_then(|d| d.get("reference")))
+            .flatten()
             .and_then(|v| v.as_str())
             .map(str::to_string),
     })

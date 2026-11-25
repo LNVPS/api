@@ -4805,7 +4805,7 @@ checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 [[package]]
 name = "payment-gateway-client"
 version = "0.1.0"
-source = "git+https://github.com/v0l/payment-gateway?rev=64b456d7129092714143880713361a36f37be275#64b456d7129092714143880713361a36f37be275"
+source = "git+https://github.com/v0l/payment-gateway?rev=209803511d765ff162d6704dffc33bd36542aaab#209803511d765ff162d6704dffc33bd36542aaab"
 dependencies = [
  "hex",
  "hmac 0.12.1",

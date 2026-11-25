@@ -622,7 +622,7 @@ impl ApiVmPayment {
                 PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data.into()),
                 PaymentMethod::OnChain => ApiPaymentData::OnChain {
                     address: value.external_data.into(),
-                    outpoint: lnvps_api_common::deposit_outpoint(&value.external_id),
+                    outpoint: lnvps_api_common::deposit_outpoint(&value.external_id, value.metadata.as_ref()),
                 },
                 PaymentMethod::FixedFloat => {
                     let data = crate::swap::SwapData::parse(value.external_data.as_str()).map_err(
@@ -632,7 +632,7 @@ impl ApiVmPayment {
                         coin: data.coin,
                         address: data.deposit_address,
                         amount: data.deposit_amount,
-                        outpoint: lnvps_api_common::deposit_outpoint(&value.external_id),
+                        outpoint: lnvps_api_common::deposit_outpoint(&value.external_id, value.metadata.as_ref()),
                     }
                 }
                 PaymentMethod::Revolut => {
@@ -1468,7 +1468,7 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
             }
             PaymentMethod::OnChain => ApiPaymentData::OnChain {
                 address: payment.external_data.clone().into(),
-                outpoint: lnvps_api_common::deposit_outpoint(&payment.external_id),
+                outpoint: lnvps_api_common::deposit_outpoint(&payment.external_id, payment.metadata.as_ref()),
             },
             PaymentMethod::FixedFloat => {
                 crate::swap::SwapData::parse(payment.external_data.as_str())
@@ -1476,7 +1476,7 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
                         coin: d.coin,
                         address: d.deposit_address,
                         amount: d.deposit_amount,
-                        outpoint: lnvps_api_common::deposit_outpoint(&payment.external_id),
+                        outpoint: lnvps_api_common::deposit_outpoint(&payment.external_id, payment.metadata.as_ref()),
                     })
                     .unwrap_or_else(|_| ApiPaymentData::Lightning(String::new()))
             }

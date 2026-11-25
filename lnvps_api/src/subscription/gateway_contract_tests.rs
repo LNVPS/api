@@ -40,6 +40,7 @@ struct World {
     sub: SubscriptionHandler,
     sub_id: u64,
     fake: Arc<FakeGateway>,
+    db: Arc<MockDb>,
 }
 
 async fn world(through_gateway: bool) -> World {
@@ -125,7 +126,12 @@ async fn world(through_gateway: bool) -> World {
             .with_swap_gateway(fake.clone())
             .with_card_gateway(fake.clone());
     }
-    World { sub, sub_id, fake }
+    World {
+        sub,
+        sub_id,
+        fake,
+        db,
+    }
 }
 
 async fn customer_json(
@@ -304,13 +310,57 @@ async fn customer_text_never_names_the_gateway() {
     }
 }
 
-#[tokio::test]
-#[ignore = "needs an attempt.received event or Attempt.receipts from the gateway, LNVPS issue 1433"]
-async fn onchain_seen_unconfirmed_shows_the_outpoint_like_in_process() {
-    let w = world(true).await;
-    let (json, payment) = customer_json(&w, PaymentMethod::OnChain, RenewMode::default())
+async fn show_seen_deposit(w: &World, payment: &SubscriptionPayment, reference: &str) -> Value {
+    let db: Arc<dyn lnvps_db::LNVpsDb> = w.db.clone();
+    let event = lnvps_api_common::GatewayEvent {
+        event_id: "seen1".into(),
+        kind: "attempt.received".into(),
+        reference: hex::encode(&payment.id),
+        status: "pending".into(),
+        amount: Some(1),
+        deposit: Some(reference.into()),
+        ..Default::default()
+    };
+    crate::payments::gateway::handle_gateway_event(&db, &w.sub, &event)
         .await
         .unwrap();
-    assert!(!payment.is_paid);
-    assert!(json["data"]["onchain"].get("outpoint").is_some());
+    let stored = w.db.get_subscription_payment(&payment.id).await.unwrap();
+    assert!(!stored.is_paid);
+    serde_json::to_value(ApiSubscriptionPayment::from(stored)).unwrap()
+}
+
+#[tokio::test]
+async fn onchain_seen_unconfirmed_shows_the_outpoint_like_in_process() {
+    let w = world(true).await;
+    let (before, payment) = customer_json(&w, PaymentMethod::OnChain, RenewMode::default())
+        .await
+        .unwrap();
+    assert!(before["data"]["onchain"].get("outpoint").is_none());
+    let json = show_seen_deposit(&w, &payment, "abc123:0").await;
+    assert_eq!(json["data"]["onchain"]["outpoint"], "abc123:0");
+    assert!(!json["is_paid"].as_bool().unwrap());
+}
+
+#[tokio::test]
+async fn fixedfloat_seen_unconfirmed_shows_the_outpoint_like_in_process() {
+    let w = world(true).await;
+    let (before, payment) = customer_json(&w, PaymentMethod::FixedFloat, RenewMode::FixedFloat {
+        coin: Currency::XMR,
+    })
+    .await
+    .unwrap();
+    assert!(before["data"]["fixedfloat"].get("outpoint").is_none());
+    let json = show_seen_deposit(&w, &payment, "def456:1").await;
+    assert_eq!(json["data"]["fixedfloat"]["outpoint"], "def456:1");
+}
+
+#[tokio::test]
+async fn seen_deposit_event_twice_changes_nothing() {
+    let w = world(true).await;
+    let (_, payment) = customer_json(&w, PaymentMethod::OnChain, RenewMode::default())
+        .await
+        .unwrap();
+    let first = show_seen_deposit(&w, &payment, "abc123:0").await;
+    let second = show_seen_deposit(&w, &payment, "abc123:0").await;
+    assert_eq!(first, second);
 }
