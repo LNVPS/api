@@ -12,6 +12,8 @@ const KEEP_VERSIONS: u64 = 3;
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub struct SanctionsConfig {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
     #[serde(default = "default_ofac_url")]
     pub ofac_url: String,
     #[serde(default = "default_eu_url")]
@@ -21,10 +23,15 @@ pub struct SanctionsConfig {
 impl Default for SanctionsConfig {
     fn default() -> Self {
         Self {
+            enabled: default_enabled(),
             ofac_url: default_ofac_url(),
             eu_url: default_eu_url(),
         }
     }
+}
+
+fn default_enabled() -> bool {
+    true
 }
 
 fn default_ofac_url() -> String {
@@ -163,6 +170,7 @@ mod tests {
 
     fn config(server: &MockServer) -> SanctionsConfig {
         SanctionsConfig {
+            enabled: true,
             ofac_url: format!("{}/ofac", server.uri()),
             eu_url: format!("{}/eu.csv", server.uri()),
         }
@@ -226,6 +234,21 @@ mod tests {
         assert!(out[0].1.is_err());
         assert!(out[1].1.is_ok());
         assert_eq!(db.list_sanctions_lists().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn config_defaults_to_the_official_lists() {
+        let cfg: SanctionsConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(cfg, SanctionsConfig::default());
+        assert!(cfg.enabled);
+        assert!(
+            cfg.ofac_url
+                .starts_with("https://sanctionslistservice.ofac.treas.gov/")
+        );
+        assert!(cfg.eu_url.starts_with("https://webgate.ec.europa.eu/"));
+        let off: SanctionsConfig =
+            serde_json::from_value(serde_json::json!({"enabled": false})).unwrap();
+        assert!(!off.enabled);
     }
 
     #[tokio::test]

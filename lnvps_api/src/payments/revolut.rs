@@ -236,6 +236,12 @@ impl RevolutPaymentHandler {
             return Ok(());
         }
         payment.external_data = serde_json::to_string(&order)?.into();
+        lnvps_api_common::sanctions::record_delegated_payment(
+            self.db.as_ref(),
+            &payment,
+            Some(revolut_screening_result(&order)),
+        )
+        .await;
 
         // Update user country from the card country if not set (best-effort).
         if let Some(cc) = order
@@ -285,5 +291,53 @@ impl RevolutPaymentHandler {
             }
         }
         Ok(())
+    }
+}
+
+fn revolut_screening_result(order: &payments_rs::fiat::RevolutOrder) -> serde_json::Value {
+    serde_json::json!({
+        "order_state": order.state,
+        "payments": order
+            .payments
+            .iter()
+            .flatten()
+            .map(|p| serde_json::json!({
+                "state": p.state,
+                "risk_level": p.risk_level,
+                "decline_reason": p.decline_reason,
+                "card_country_code": p.payment_method.as_ref().and_then(|m| m.card_country_code.clone()),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screening_result_keeps_what_revolut_returned() {
+        let order: payments_rs::fiat::RevolutOrder = serde_json::from_value(serde_json::json!({
+            "id": "o1",
+            "token": "t",
+            "state": "completed",
+            "created_at": "2026-11-20T00:00:00Z",
+            "updated_at": "2026-11-20T00:00:00Z",
+            "amount": 500,
+            "currency": "EUR",
+            "outstanding_amount": 0,
+            "payments": [{
+                "id": "p1",
+                "state": "completed",
+                "amount": 500,
+                "risk_level": "low",
+                "payment_method": {"type": "card", "card_country_code": "IE"}
+            }]
+        }))
+        .unwrap();
+        let r = revolut_screening_result(&order);
+        assert_eq!(r["order_state"], "completed");
+        assert_eq!(r["payments"][0]["risk_level"], "low");
+        assert_eq!(r["payments"][0]["card_country_code"], "IE");
     }
 }

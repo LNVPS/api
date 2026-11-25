@@ -117,6 +117,9 @@ pub struct Settings {
 
     #[serde(default)]
     pub gateway: Option<lnvps_api_common::GatewayConfig>,
+
+    #[serde(default)]
+    pub sanctions: lnvps_api_common::sanctions::SanctionsConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -789,6 +792,7 @@ pub fn mock_settings() -> Settings {
         session: None,
         app_backups: None,
         gateway: None,
+        sanctions: Default::default(),
     }
 }
 

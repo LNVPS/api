@@ -57,6 +57,8 @@ pub trait ChainExplorer: Send + Sync {
 
     /// What spends `outpoint`, if anything.
     async fn outspend(&self, outpoint: &OutPoint) -> Result<Outspend>;
+
+    async fn tx_input_addresses(&self, txid: &str) -> Result<Option<Vec<String>>>;
 }
 
 /// Build a [`ChainExplorer`] from configuration.
@@ -96,6 +98,23 @@ struct EsploraTx {
 struct EsploraVin {
     txid: String,
     vout: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct EsploraTxPrevouts {
+    vin: Vec<EsploraVinPrevout>,
+}
+
+#[derive(serde::Deserialize)]
+struct EsploraVinPrevout {
+    #[serde(default)]
+    is_coinbase: bool,
+    prevout: Option<EsploraPrevout>,
+}
+
+#[derive(serde::Deserialize)]
+struct EsploraPrevout {
+    scriptpubkey_address: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -152,6 +171,33 @@ impl ChainExplorer for MempoolChainExplorer {
             spent_by: res.txid.filter(|_| res.spent),
             confirmed: res.status.map(|s| s.confirmed).unwrap_or(false),
         })
+    }
+
+    async fn tx_input_addresses(&self, txid: &str) -> Result<Option<Vec<String>>> {
+        let res = self
+            .client
+            .get(self.url(&format!("tx/{txid}")))
+            .send()
+            .await?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let tx: EsploraTxPrevouts = res
+            .error_for_status()?
+            .json()
+            .await
+            .context("parsing esplora transaction")?;
+        let mut out = Vec::new();
+        for vin in tx.vin {
+            if vin.is_coinbase {
+                continue;
+            }
+            match vin.prevout.and_then(|p| p.scriptpubkey_address) {
+                Some(a) => out.push(a),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(out))
     }
 }
 
@@ -263,6 +309,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_tx_input_addresses_reads_prevouts() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/tx/dep"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "vin": [
+                    {"txid": "a", "vout": 0, "prevout": {"scriptpubkey_address": "bc1qsource1"}},
+                    {"txid": "b", "vout": 1, "prevout": {"scriptpubkey_address": "3Source2"}}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tx/bare"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "vin": [{"txid": "a", "vout": 0, "prevout": {"scriptpubkey_address": null}}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/tx/gone"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let explorer = MempoolChainExplorer::new(server.uri());
+        assert_eq!(
+            explorer.tx_input_addresses("dep").await.unwrap(),
+            Some(vec!["bc1qsource1".to_string(), "3Source2".to_string()])
+        );
+        assert_eq!(explorer.tx_input_addresses("bare").await.unwrap(), None);
+        assert_eq!(explorer.tx_input_addresses("gone").await.unwrap(), None);
+    }
+
+    #[tokio::test]
     async fn test_http_errors_propagate() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -278,5 +359,6 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(explorer.tx_input_addresses("boom").await.is_err());
     }
 }

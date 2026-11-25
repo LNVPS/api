@@ -38,11 +38,15 @@
 //!   billing interval (`PricingEngine::get_subscription_cost_by_amount`), so
 //!   every payment is re-generated uniformly from current line-item pricing.
 
+use crate::chain::ChainExplorer;
 use crate::subscription::SubscriptionHandler;
 use crate::swap::SwapData;
 use anyhow::{Result, bail};
 use chrono::Utc;
 use futures::StreamExt;
+use lnvps_api_common::sanctions::{
+    DepositDecision, DepositScreen, ListSanctionsProvider, Screener,
+};
 use lnvps_api_common::{CostResult, WorkJob};
 use lnvps_db::{
     AccountCreditTopup, AccountType, LNVpsDb, OnchainAddressOwner, PaymentMethod,
@@ -54,13 +58,46 @@ use payments_rs::onchain::{ChainPaymentUpdate, OnChainProvider};
 use std::sync::Arc;
 
 pub struct OnChainPaymentHandler {
-    provider: Arc<dyn OnChainProvider>,
+    provider: Option<Arc<dyn OnChainProvider>>,
     db: Arc<dyn LNVpsDb>,
     sub_handler: SubscriptionHandler,
+    screening: Option<DepositScreening>,
     /// Deposits to deleted VMs already reported to admins (in-memory only:
     /// these deposits are ignored database-wise and handled out of band, this
     /// set just stops stream replays from re-notifying within one process).
     reported_deposits: tokio::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+#[derive(Clone)]
+pub struct DepositScreening {
+    pub screener: Screener,
+    pub explorer: Option<Arc<dyn ChainExplorer>>,
+}
+
+impl DepositScreening {
+    pub fn new(
+        config: &lnvps_api_common::sanctions::SanctionsConfig,
+        explorer: &crate::settings::ChainExplorerConfig,
+        db: Arc<dyn LNVpsDb>,
+        work: Arc<dyn lnvps_api_common::WorkCommander>,
+    ) -> Option<Self> {
+        config.enabled.then(|| Self {
+            screener: Screener::new(db.clone(), Arc::new(ListSanctionsProvider::new(db)))
+                .with_notifier(work),
+            explorer: crate::chain::build_chain_explorer(explorer),
+        })
+    }
+
+    pub async fn source_addresses(&self, txid: &str) -> Option<Vec<String>> {
+        let explorer = self.explorer.as_ref()?;
+        match explorer.tx_input_addresses(txid).await {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("Cannot read source addresses of {}: {}", txid, e);
+                None
+            }
+        }
+    }
 }
 
 /// Unique key for one deposit: the standard outpoint notation `{txid}:{vout}`.
@@ -98,11 +135,70 @@ impl OnChainPaymentHandler {
         sub_handler: SubscriptionHandler,
     ) -> Self {
         Self {
-            provider,
+            provider: Some(provider),
             db,
             sub_handler,
+            screening: None,
             reported_deposits: Default::default(),
         }
+    }
+
+    pub fn for_settlement(db: Arc<dyn LNVpsDb>, sub_handler: SubscriptionHandler) -> Self {
+        Self {
+            provider: None,
+            db,
+            sub_handler,
+            screening: None,
+            reported_deposits: Default::default(),
+        }
+    }
+
+    pub fn with_screening(mut self, screening: Option<DepositScreening>) -> Self {
+        self.screening = screening;
+        self
+    }
+
+    async fn screen(
+        &self,
+        method: PaymentMethod,
+        key: &str,
+        address: &str,
+        amount_msat: u64,
+        user_id: Option<u64>,
+        payment_id: Option<&[u8]>,
+    ) -> Result<bool> {
+        let Some(s) = &self.screening else {
+            return Ok(true);
+        };
+        if method != PaymentMethod::OnChain {
+            s.screener
+                .record_delegated(key, payment_id, user_id, method)
+                .await?;
+            return Ok(true);
+        }
+        let txid = key.rsplit_once(':').map(|(t, _)| t).unwrap_or(key);
+        let sources = match self.db.get_payment_screening(key).await? {
+            Some(_) => None,
+            None => s.source_addresses(txid).await,
+        };
+        let decision = s
+            .screener
+            .screen_deposit(
+                &DepositScreen {
+                    payment_ref: key.to_string(),
+                    payment_id: payment_id.map(<[u8]>::to_vec),
+                    user_id,
+                    method: PaymentMethod::OnChain,
+                    address: address.to_string(),
+                    amount_msat,
+                },
+                sources,
+            )
+            .await?;
+        if decision == DepositDecision::Hold {
+            info!("Deposit {} held by sanctions screening, not credited", key);
+        }
+        Ok(decision == DepositDecision::Credit)
     }
 
     /// Find the payment a deposit belongs to: the most recent on-chain payment
@@ -182,6 +278,19 @@ impl OnChainPaymentHandler {
                         debug!("Deposit {} to settled swap address, ignoring", key);
                         return Ok(true);
                     }
+                    if !self
+                        .screen(
+                            found.payment_method,
+                            key,
+                            address,
+                            amount_msat,
+                            Some(found.user_id),
+                            None,
+                        )
+                        .await?
+                    {
+                        return Ok(true);
+                    }
                     let id = self
                         .db
                         .insert_account_credit_topup(&AccountCreditTopup {
@@ -199,6 +308,19 @@ impl OnChainPaymentHandler {
         };
         if topup.is_paid {
             debug!("Skipping already processed deposit {}", key);
+            return Ok(true);
+        }
+        if !self
+            .screen(
+                topup.payment_method,
+                key,
+                address,
+                amount_msat,
+                Some(topup.user_id),
+                None,
+            )
+            .await?
+        {
             return Ok(true);
         }
         self.db
@@ -357,6 +479,23 @@ impl OnChainPaymentHandler {
         amount_msat: u64,
     ) -> Result<()> {
         let note = format!("{key}: late on-chain payment after the order was removed");
+        if owner.credited_outpoint.as_deref() == Some(key) {
+            debug!("Late deposit {} already credited", key);
+            return Ok(());
+        }
+        if !self
+            .screen(
+                PaymentMethod::OnChain,
+                key,
+                owner.address.as_str(),
+                amount_msat,
+                Some(owner.user_id),
+                owner.payment_id.as_deref(),
+            )
+            .await?
+        {
+            return Ok(());
+        }
         let Some(balance) = self
             .db
             .credit_onchain_address_owner(owner.id, key, amount_msat, &note)
@@ -664,6 +803,28 @@ impl OnChainPaymentHandler {
             },
         };
 
+        if payment.is_paid && payment.payment_method != PaymentMethod::OnChain {
+            debug!(
+                "Deposit {} to settled swap address of payment {}, ignoring",
+                key,
+                hex::encode(&payment.id)
+            );
+            return Ok(());
+        }
+        if !self
+            .screen(
+                payment.payment_method,
+                &key,
+                address,
+                amount_msat,
+                Some(payment.user_id),
+                (!payment.is_paid).then_some(payment.id.as_slice()),
+            )
+            .await?
+        {
+            return Ok(());
+        }
+
         // A deposit for a deleted VM is ignored database-wise: just alert the
         // admins — the sender is expected to contact support so it can be
         // resolved out of band.
@@ -757,11 +918,81 @@ impl OnChainPaymentHandler {
         Ok(())
     }
 
+    pub async fn release_held_deposit(&self, payment_ref: &str) -> Result<bool> {
+        let Some(row) = self.db.get_payment_screening(payment_ref).await? else {
+            bail!("no screening recorded for {payment_ref}");
+        };
+        if !row.held {
+            return Ok(false);
+        }
+        if lnvps_api_common::sanctions::payment_blocked(self.db.as_ref(), payment_ref).await? {
+            bail!("deposit {payment_ref} still has open or confirmed sanctions matches");
+        }
+        let released = self.db.release_payment_screening(payment_ref).await?;
+        let Some((txid, vout)) = payment_ref
+            .rsplit_once(':')
+            .and_then(|(t, v)| v.parse::<u32>().ok().map(|v| (t, v)))
+        else {
+            bail!("{payment_ref} is not an outpoint");
+        };
+        let address = row
+            .address
+            .as_ref()
+            .map(|a| a.as_str().to_string())
+            .unwrap_or_default();
+        self.handle_deposit(&address, txid, vout, row.amount_msat.unwrap_or_default())
+            .await?;
+        if released {
+            info!("Released held deposit {} for crediting", payment_ref);
+        }
+        Ok(released)
+    }
+
+    pub async fn rescreen_unscreened_deposits(&self) -> Result<u64> {
+        let Some(s) = &self.screening else {
+            return Ok(0);
+        };
+        let (rows, _) = self
+            .db
+            .list_payment_screenings(
+                &lnvps_db::PaymentScreeningFilter {
+                    held: Some(true),
+                    ..Default::default()
+                },
+                500,
+                0,
+            )
+            .await?;
+        let mut released = 0;
+        for row in rows
+            .into_iter()
+            .filter(|r| r.mode == lnvps_db::ScreeningMode::Unscreened)
+        {
+            let txid = row
+                .payment_ref
+                .rsplit_once(':')
+                .map(|(t, _)| t.to_string())
+                .unwrap_or_default();
+            let Some(sources) = s.source_addresses(&txid).await else {
+                continue;
+            };
+            if s.screener.rescreen_deposit(&row, sources).await? == DepositDecision::Credit
+                && self.release_held_deposit(&row.payment_ref).await?
+            {
+                released += 1;
+            }
+        }
+        Ok(released)
+    }
+
     pub async fn listen(&mut self) -> Result<()> {
         info!("Listening for on-chain deposits");
+        let Some(provider) = self.provider.clone() else {
+            bail!("no on-chain provider");
+        };
         // Subscribe from the start; the deposit-key de-dupe above makes
         // replaying history harmless (at-least-once -> exactly-once).
-        let mut stream = self.provider.subscribe_payments(None).await?;
+        let mut stream = provider.subscribe_payments(None).await?;
         while let Some(update) = stream.next().await {
             match update {
                 ChainPaymentUpdate::Confirmed {
@@ -1857,6 +2088,252 @@ mod tests {
         assert_eq!(db.subscription_payments.lock().await.len(), 1);
         assert_eq!(first.time_value, again.time_value);
         assert_eq!(first.external_id, again.external_id);
+        Ok(())
+    }
+
+    async fn load_fixture_lists(db: &MockDb) -> Result<()> {
+        use lnvps_api_common::sanctions::{encode_entries, fixtures};
+        for list in [fixtures::ofac()?, fixtures::eu()?] {
+            db.insert_sanctions_list(&lnvps_db::SanctionsList {
+                source: list.source.clone(),
+                version: "fixture".into(),
+                sha256: "00".into(),
+                entry_count: list.entries.len() as u32,
+                entries: encode_entries(&list.entries)?,
+                fetched: Utc::now(),
+                checked: Utc::now(),
+                ..Default::default()
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn screened(
+        db: &Arc<MockDb>,
+        handler: OnChainPaymentHandler,
+        sources: &[(&str, &[&str])],
+    ) -> Result<OnChainPaymentHandler> {
+        load_fixture_lists(db).await?;
+        let explorer = crate::mocks::MockChainExplorer::default();
+        for (txid, addrs) in sources {
+            explorer.input_addresses.lock().await.insert(
+                txid.to_string(),
+                addrs.iter().map(|a| a.to_string()).collect(),
+            );
+        }
+        let screener = Screener::new(db.clone(), Arc::new(ListSanctionsProvider::new(db.clone())));
+        Ok(handler.with_screening(Some(DepositScreening {
+            screener,
+            explorer: Some(Arc::new(explorer)),
+        })))
+    }
+
+    async fn clear_payment_matches(db: &MockDb, payment_ref: &str) -> Result<()> {
+        let (rows, _) = db
+            .list_sanctions_matches(
+                &lnvps_db::SanctionsMatchFilter {
+                    payment_ref: Some(payment_ref.into()),
+                    ..Default::default()
+                },
+                100,
+                0,
+            )
+            .await?;
+        assert!(!rows.is_empty());
+        for m in rows {
+            db.resolve_sanctions_match(
+                m.id,
+                lnvps_db::SanctionsMatchStatus::Cleared,
+                1,
+                "fixture: false positive",
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_listed_source_address_is_held_not_credited_or_refunded() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        let handler = screened(
+            &db,
+            handler,
+            &[(
+                "txbad",
+                &[lnvps_api_common::sanctions::fixtures::OFAC_LISTED_ADDRESS],
+            )],
+        )
+        .await?;
+
+        handler
+            .handle_deposit(ADDRESS, "txbad", 0, EXPECTED)
+            .await?;
+        handler
+            .handle_deposit(ADDRESS, "txbad", 0, EXPECTED)
+            .await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(!p.is_paid);
+        assert!(db.account_credit_topups.lock().await.is_empty());
+        let key = deposit_key("txbad", 0);
+        let row = db.get_payment_screening(&key).await?.unwrap();
+        assert!(row.is_held());
+        assert_eq!(row.payment_id.as_deref(), Some(payment.id.as_slice()));
+        assert_eq!(row.amount_msat, Some(EXPECTED));
+        let (matches, _) = db
+            .list_sanctions_matches(
+                &lnvps_db::SanctionsMatchFilter {
+                    payment_ref: Some(key),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await?;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].status, lnvps_db::SanctionsMatchStatus::Held);
+        assert_eq!(matches[0].list_source, "ofac_sdn");
+        assert_eq!(matches[0].list_version, "fixture");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_source_address_is_credited() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        let handler = screened(
+            &db,
+            handler,
+            &[(
+                "txok",
+                &[lnvps_api_common::sanctions::fixtures::UNLISTED_ADDRESS],
+            )],
+        )
+        .await?;
+
+        handler.handle_deposit(ADDRESS, "txok", 0, EXPECTED).await?;
+
+        assert!(get_payment(&db, &payment.id).await.is_paid);
+        let row = db
+            .get_payment_screening(&deposit_key("txok", 0))
+            .await?
+            .unwrap();
+        assert_eq!(row.mode, lnvps_db::ScreeningMode::Screened);
+        assert!(!row.held);
+        assert!(db.sanctions_matches.lock().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_deposit_whose_sources_are_unknown_is_held_until_screened() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        let handler = screened(&db, handler, &[]).await?;
+
+        handler
+            .handle_deposit(ADDRESS, "txunk", 0, EXPECTED)
+            .await?;
+        assert!(!get_payment(&db, &payment.id).await.is_paid);
+        assert_eq!(handler.rescreen_unscreened_deposits().await?, 0);
+
+        if let Some(s) = &handler.screening {
+            let explorer = crate::mocks::MockChainExplorer::default();
+            explorer.input_addresses.lock().await.insert(
+                "txunk".into(),
+                vec![lnvps_api_common::sanctions::fixtures::UNLISTED_ADDRESS.into()],
+            );
+            let handler =
+                OnChainPaymentHandler::for_settlement(db.clone(), handler.sub_handler.clone())
+                    .with_screening(Some(DepositScreening {
+                        screener: s.screener.clone(),
+                        explorer: Some(Arc::new(explorer)),
+                    }));
+            assert_eq!(handler.rescreen_unscreened_deposits().await?, 1);
+        }
+        assert!(get_payment(&db, &payment.id).await.is_paid);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clearing_a_hold_releases_the_payment_exactly_once() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        let handler = screened(
+            &db,
+            handler,
+            &[(
+                "txbad",
+                &[lnvps_api_common::sanctions::fixtures::OFAC_LISTED_ADDRESS],
+            )],
+        )
+        .await?;
+        let key = deposit_key("txbad", 0);
+        handler
+            .handle_deposit(ADDRESS, "txbad", 0, EXPECTED)
+            .await?;
+        assert!(handler.release_held_deposit(&key).await.is_err());
+        assert!(!get_payment(&db, &payment.id).await.is_paid);
+
+        clear_payment_matches(&db, &key).await?;
+        let sub_before = db.get_subscription(payment.subscription_id).await?;
+        assert!(handler.release_held_deposit(&key).await?);
+        let paid = get_payment(&db, &payment.id).await;
+        assert!(paid.is_paid);
+        assert_eq!(paid.external_id, Some(key.clone()));
+        let sub_after = db.get_subscription(payment.subscription_id).await?;
+        assert_ne!(sub_before.expires, sub_after.expires);
+
+        assert!(!handler.release_held_deposit(&key).await?);
+        handler
+            .handle_deposit(ADDRESS, "txbad", 0, EXPECTED)
+            .await?;
+        assert_eq!(
+            db.get_subscription(payment.subscription_id).await?.expires,
+            sub_after.expires
+        );
+        assert_eq!(db.subscription_payments.lock().await.len(), 1);
+        assert!(db.account_credit_topups.lock().await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_held_topup_deposit_is_credited_once_after_clearing() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        let handler = screened(
+            &db,
+            handler,
+            &[(
+                "txtop",
+                &[lnvps_api_common::sanctions::fixtures::EU_LISTED_ADDRESS],
+            )],
+        )
+        .await?;
+        add_topup(
+            &db,
+            payment.user_id,
+            PaymentMethod::OnChain,
+            TOPUP_ADDRESS.to_string(),
+        )
+        .await?;
+        let key = deposit_key("txtop", 0);
+
+        handler
+            .handle_deposit(TOPUP_ADDRESS, "txtop", 0, 50_000_000)
+            .await?;
+        assert!(
+            db.account_credit_topups
+                .lock()
+                .await
+                .iter()
+                .all(|t| !t.is_paid)
+        );
+
+        clear_payment_matches(&db, &key).await?;
+        assert!(handler.release_held_deposit(&key).await?);
+        assert!(!handler.release_held_deposit(&key).await?);
+        handler
+            .handle_deposit(TOPUP_ADDRESS, "txtop", 0, 50_000_000)
+            .await?;
+        let topups = db.account_credit_topups.lock().await;
+        assert_eq!(topups.iter().filter(|t| t.is_paid).count(), 1);
         Ok(())
     }
 

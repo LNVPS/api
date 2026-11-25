@@ -427,6 +427,12 @@ async fn main() -> Result<(), Error> {
         tasks.push(
             worker.spawn_job_interval(WorkJob::PurgeExpiredRecords, Duration::from_secs(86400)),
         );
+        if settings.sanctions.enabled {
+            tasks.push(
+                worker
+                    .spawn_job_interval(WorkJob::RefreshSanctionsLists, Duration::from_secs(86400)),
+            );
+        }
         tasks.push(worker.spawn_job_interval(WorkJob::CheckIpOrders, Duration::from_secs(300)));
         tasks.push(worker.spawn_handler_loop());
 

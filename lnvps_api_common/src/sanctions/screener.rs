@@ -184,6 +184,24 @@ impl Screener {
         &self.provider
     }
 
+    pub async fn record_delegated(
+        &self,
+        payment_ref: &str,
+        payment_id: Option<&[u8]>,
+        user_id: Option<u64>,
+        method: PaymentMethod,
+    ) -> Result<()> {
+        record_delegated_screening(
+            self.db.as_ref(),
+            payment_ref,
+            payment_id,
+            user_id,
+            method,
+            None,
+        )
+        .await
+    }
+
     async fn notify(&self, title: String, message: String) {
         let Some(work) = &self.work else {
             return;
@@ -463,16 +481,19 @@ fn hits_json(hits: &[Hit]) -> serde_json::Value {
 
 pub async fn record_delegated_screening(
     db: &dyn LNVpsDb,
-    payment_id: &[u8],
-    user_id: u64,
+    payment_ref: &str,
+    payment_id: Option<&[u8]>,
+    user_id: Option<u64>,
     method: PaymentMethod,
-    provider: &str,
     result: Option<serde_json::Value>,
 ) -> Result<()> {
+    let Some(provider) = delegated_provider(method) else {
+        return Ok(());
+    };
     db.insert_payment_screening(&PaymentScreening {
-        payment_ref: hex::encode(payment_id),
-        payment_id: Some(payment_id.to_vec()),
-        user_id: Some(user_id),
+        payment_ref: payment_ref.to_string(),
+        payment_id: payment_id.map(<[u8]>::to_vec),
+        user_id,
         payment_method: method,
         mode: ScreeningMode::Delegated,
         provider: provider.to_string(),
@@ -481,6 +502,29 @@ pub async fn record_delegated_screening(
     })
     .await?;
     Ok(())
+}
+
+pub async fn record_delegated_payment(
+    db: &dyn LNVpsDb,
+    payment: &lnvps_db::SubscriptionPayment,
+    result: Option<serde_json::Value>,
+) {
+    if let Err(e) = record_delegated_screening(
+        db,
+        &hex::encode(&payment.id),
+        Some(&payment.id),
+        Some(payment.user_id),
+        payment.payment_method,
+        result,
+    )
+    .await
+    {
+        warn!(
+            "Failed to record delegated screening for payment {}: {}",
+            hex::encode(&payment.id),
+            e
+        );
+    }
 }
 
 pub fn delegated_provider(method: PaymentMethod) -> Option<&'static str> {
@@ -703,34 +747,28 @@ mod tests {
     #[tokio::test]
     async fn delegated_checks_are_recorded_once() {
         let db = Arc::new(MockDb::default());
+        let r = hex::encode([1u8; 32]);
         record_delegated_screening(
             db.as_ref(),
-            &[1u8; 32],
-            1,
+            &r,
+            Some(&[1u8; 32]),
+            Some(1),
             PaymentMethod::Revolut,
-            "revolut",
             Some(serde_json::json!({"risk_level": "low"})),
         )
         .await
         .unwrap();
-        record_delegated_screening(
-            db.as_ref(),
-            &[1u8; 32],
-            1,
-            PaymentMethod::Revolut,
-            "revolut",
-            None,
-        )
-        .await
-        .unwrap();
-        let row = db
-            .get_payment_screening(&hex::encode([1u8; 32]))
+        record_delegated_screening(db.as_ref(), &r, None, Some(1), PaymentMethod::Revolut, None)
             .await
-            .unwrap()
             .unwrap();
+        let row = db.get_payment_screening(&r).await.unwrap().unwrap();
         assert_eq!(row.mode, ScreeningMode::Delegated);
+        assert_eq!(row.provider, "revolut");
         assert_eq!(row.result.as_deref(), Some(r#"{"risk_level":"low"}"#));
-        assert_eq!(delegated_provider(PaymentMethod::OnChain), None);
+        record_delegated_screening(db.as_ref(), "x:0", None, None, PaymentMethod::OnChain, None)
+            .await
+            .unwrap();
+        assert!(db.get_payment_screening("x:0").await.unwrap().is_none());
         assert_eq!(delegated_provider(PaymentMethod::Stripe), Some("stripe"));
     }
 }
