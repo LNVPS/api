@@ -3983,6 +3983,55 @@ Customer endpoints: `GET /api/v1/abuse/cases`, `GET /api/v1/abuse/cases/{id}` (d
 withheld ones left out, and the date each can be challenged until) and `POST /api/v1/abuse/cases/{id}/challenges`.
 The reporter's email and the reported IP are never returned to the customer.
 
+### Sanctions Screening
+
+On-chain deposits and customers are screened against the OFAC SDN list and the EU consolidated financial sanctions
+list, refreshed daily by the worker (see `docs/config.md`). A hit holds and flags for review; nothing is rejected
+outright. Every match is logged with the list, its version and fetch time, the matched entry and a score.
+
+Permission resource is `sanctions` (`create`, `view`, `update`, `delete`), granted to `super_admin` by default.
+
+```
+GET  /api/admin/v1/sanctions/lists
+POST /api/admin/v1/sanctions/lists/refresh
+GET  /api/admin/v1/sanctions/matches?open=&status=&subject=&user_id=&payment_ref=&limit=&offset=
+GET  /api/admin/v1/sanctions/matches/{id}
+POST /api/admin/v1/sanctions/matches/{id}/clear
+POST /api/admin/v1/sanctions/matches/{id}/confirm
+GET  /api/admin/v1/sanctions/screenings?held=&user_id=&payment_id=&limit=&offset=
+POST /api/admin/v1/sanctions/users/{id}/screen
+```
+
+- **Lists** (`sanctions::view`): the newest stored version of each list: `id`, `source` (`ofac_sdn`, `eu_fsf`),
+  `version`, `sha256`, `entry_count`, `fetched`, `checked`. **Refresh** (`sanctions::update`) queues the fetch now and
+  is audited as `admin.sanctions.refresh`.
+- **Matches** (`sanctions::view`): `id`, `created`, `subject` (`user`, `payment`), `user_id`, `payment_ref` (the deposit
+  outpoint `txid:vout`), `field` (`name`, `email`, `entity`, `address`), `subject_value`, `list_source`,
+  `list_version`, `list_fetched`, `entry_id`, `entry_name`, `score` (1.0 for an exact or normalised exact match),
+  `status` (`review`, `held`, `cleared`, `confirmed`), `resolved_by`, `resolved_at`, `resolution_reason`. `open=true`
+  lists `review` and `held`. The single match adds `screening` (the payment screening row for a payment match) and
+  `orders_held` (for a user match, whether new orders are still on hold).
+  - `held`: an exact name or email match, a listed source address, or the entity rule (a customer with a tax id whose
+    country or VAT prefix is Russia or Belarus, `list_source: eu_reg_833_2014_art_5b`). New VM orders for the user, or
+    the deposit, are held.
+  - `review`: a near name match (score 0.90 to 0.999) or a single-word name. Nothing is held.
+- **Clear or confirm** (`sanctions::update`): body `{reason}` (required). Only an open match can be resolved; a second
+  call returns 409. Audited as `admin.sanctions.clear` or `admin.sanctions.confirm` with the admin and the reason.
+  Clearing the last blocking match on a held deposit queues `ReleaseHeldDeposit`, which credits it exactly once.
+  Confirming keeps the hold. Customers with a `confirmed` match stay held for new orders. Existing VMs are never
+  touched.
+- **Screenings** (`sanctions::view`): one row per settled payment or detected deposit: `payment_ref`, `payment_id`,
+  `user_id`, `payment_method`, `mode` (`screened` against the lists, `delegated` to the provider, `unscreened` when the
+  sources could not be read or no list was loaded), `provider`, `result` (the hits, or what the provider returned),
+  `held`, `source_addresses`, `amount_msat`, `created`, `released_at`. Unscreened deposits are held and rescreened every
+  10 minutes.
+- **Screen a user now** (`sanctions::update`): returns `{held, review, new_matches}`.
+
+`GET /api/admin/v1/subscription_payments/{id}` includes the payment's `screening` rows when there are any.
+
+When a customer's orders are held, `POST /api/v1/vm` and `POST /api/v1/vm/custom-template` return 403 with
+"New orders on this account are on hold pending a compliance review. Please contact support."
+
 ### Swap Order Clients
 
 Every FixedFloat swap order records who placed it and from where. Rows are kept for 13 months (395 days) and then deleted by
