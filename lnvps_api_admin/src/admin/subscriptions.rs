@@ -572,7 +572,22 @@ async fn admin_get_subscription_payment(
         .await?
         .pop()
         .map(Into::into);
-    ApiData::ok(AdminSubscriptionPaymentInfo::from_with_company(payment).with_discount(discount))
+    let (screening, _) = this
+        .db
+        .list_payment_screenings(
+            &lnvps_db::PaymentScreeningFilter {
+                payment_id: Some(payment_id.clone()),
+                ..Default::default()
+            },
+            20,
+            0,
+        )
+        .await?;
+    ApiData::ok(
+        AdminSubscriptionPaymentInfo::from_with_company(payment)
+            .with_discount(discount)
+            .with_screening(screening.into_iter().map(Into::into).collect()),
+    )
 }
 
 /// Manually mark a subscription payment as paid (admin override).

@@ -427,6 +427,15 @@ async fn main() -> Result<(), Error> {
         tasks.push(
             worker.spawn_job_interval(WorkJob::PurgeExpiredRecords, Duration::from_secs(86400)),
         );
+        if settings.sanctions.enabled {
+            tasks.push(
+                worker
+                    .spawn_job_interval(WorkJob::RefreshSanctionsLists, Duration::from_secs(86400)),
+            );
+            tasks.push(
+                worker.spawn_job_interval(WorkJob::RescreenHeldDeposits, Duration::from_secs(600)),
+            );
+        }
         tasks.push(worker.spawn_job_interval(WorkJob::CheckIpOrders, Duration::from_secs(300)));
         tasks.push(worker.spawn_handler_loop());
 
@@ -654,6 +663,11 @@ async fn main() -> Result<(), Error> {
                     ),
                 ))
                 .with_state(RouterState {
+                    screener: lnvps_api::api::build_screener(
+                        &settings,
+                        db.clone(),
+                        worker.commander(),
+                    ),
                     db,
                     state: status,
                     sub_handler,

@@ -399,6 +399,11 @@ pub enum WorkJob {
         /// Hex-encoded `subscription_payment.id`.
         payment_id: String,
     },
+    RefreshSanctionsLists,
+    RescreenHeldDeposits,
+    ReleaseHeldDeposit {
+        payment_ref: String,
+    },
 }
 
 /// Redis stream carrying reconcile triggers for one app cluster (issue #254).
@@ -422,6 +427,8 @@ impl WorkJob {
             Self::CheckVms => true,
             Self::CheckSubscriptions => true,
             Self::PurgeExpiredRecords => true,
+            Self::RefreshSanctionsLists => true,
+            Self::RescreenHeldDeposits => true,
             // A discovery request is a one-shot read tied to a waiting admin
             // request; never retry it if it fails.
             Self::ListUnmanagedVms { .. } => true,
@@ -454,6 +461,9 @@ impl fmt::Display for WorkJob {
         match self {
             WorkJob::ReconcileAppDeployment { .. } => write!(f, "ReconcileAppDeployment"),
             WorkJob::ApplySubscriptionPayment { .. } => write!(f, "ApplySubscriptionPayment"),
+            WorkJob::RefreshSanctionsLists => write!(f, "RefreshSanctionsLists"),
+            WorkJob::RescreenHeldDeposits => write!(f, "RescreenHeldDeposits"),
+            WorkJob::ReleaseHeldDeposit { .. } => write!(f, "ReleaseHeldDeposit"),
             WorkJob::PatchHosts => write!(f, "PatchHosts"),
             WorkJob::PatchHost { .. } => write!(f, "PatchHost"),
             WorkJob::CheckVms => write!(f, "CheckVms"),

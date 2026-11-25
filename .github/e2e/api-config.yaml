@@ -9,6 +9,11 @@ public-url: "http://localhost:8000"
 reserved-domains:
   - "lnvps.net"
 read-only: true
+# Sanctions screening is unit tested against pinned fixtures. Here it would
+# fetch the live lists and hold every regtest deposit, whose source addresses
+# no explorer can see.
+sanctions:
+  enabled: false
 redis:
   url: "redis://localhost:6399"
   ttl: 30

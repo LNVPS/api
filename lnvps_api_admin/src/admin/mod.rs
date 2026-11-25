@@ -41,6 +41,7 @@ mod regions;
 mod reports;
 mod roles;
 mod routers;
+mod sanctions;
 mod subscriptions;
 mod swap_orders;
 #[cfg(test)]
@@ -102,6 +103,7 @@ pub fn admin_router(
         .merge(vm_templates::router())
         .merge(companies::router())
         .merge(abuse::router())
+        .merge(sanctions::router())
         .merge(credit::router())
         .merge(credit_rebook::router())
         .merge(swap_orders::router())

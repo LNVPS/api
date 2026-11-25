@@ -222,6 +222,7 @@ pub struct Worker {
     refunds: crate::refund::VmRefundHandler,
     chain_explorer: Option<Arc<dyn crate::chain::ChainExplorer>>,
     ip_orders: Arc<lnvps_api_common::ip_provider::IpOrderService>,
+    deposits: Arc<crate::payments::onchain::OnChainPaymentHandler>,
 }
 
 #[derive(Clone)]
@@ -256,6 +257,7 @@ pub struct WorkerSettings {
     /// deployment with no nostr key: such a worker patches its own hosts and
     /// leaves nodes' hardware as last reported.
     pub node_control: Option<lnvps_api_common::node_control::NodeControl>,
+    pub sanctions: lnvps_api_common::sanctions::SanctionsConfig,
 }
 
 impl From<&Settings> for WorkerSettings {
@@ -293,6 +295,7 @@ impl From<&Settings> for WorkerSettings {
                 .map(|r| r.fee_estimator.clone())
                 .unwrap_or_default(),
             chain_explorer: val.chain_explorer.clone(),
+            sanctions: val.sanctions.clone(),
             node_control: val.nostr.as_ref().and_then(|n| {
                 match lnvps_api_common::node_control::NodeControl::new(&n.nsec) {
                     Ok(c) => Some(c),
@@ -395,7 +398,21 @@ impl Worker {
             work_commander.clone(),
         ));
 
+        let deposits = Arc::new(
+            crate::payments::onchain::OnChainPaymentHandler::for_settlement(
+                db.clone(),
+                subscription_handler.clone(),
+            )
+            .with_screening(crate::payments::onchain::DepositScreening::new(
+                &settings.sanctions,
+                &settings.chain_explorer,
+                db.clone(),
+                work_commander.clone(),
+            )),
+        );
+
         Ok(Self {
+            deposits,
             chain_explorer,
             ip_orders,
             db,
@@ -1431,6 +1448,41 @@ impl Worker {
     ///
     /// Re-marking it paid here would extend the subscription a second time, so
     /// an unpaid payment is a routing bug and is refused rather than completed.
+    pub async fn refresh_sanctions_lists(&self) -> Result<()> {
+        if !self.settings.sanctions.enabled {
+            return Ok(());
+        }
+        let fetcher = lnvps_api_common::sanctions::SanctionsListFetcher::new(
+            self.db.clone(),
+            self.settings.sanctions.clone(),
+        )?;
+        let failed: Vec<String> = fetcher
+            .refresh()
+            .await
+            .into_iter()
+            .filter_map(|(source, r)| r.err().map(|e| format!("{source}: {e:#}")))
+            .collect();
+        let released = self.deposits.rescreen_unscreened_deposits().await?;
+        if released > 0 {
+            info!(
+                "Released {} deposits held only for want of screening",
+                released
+            );
+        }
+        if !failed.is_empty() {
+            self.work_commander
+                .send(WorkJob::SendAdminNotification {
+                    title: Some("Sanctions list refresh failed".to_string()),
+                    message: format!(
+                        "The daily sanctions list refresh failed. Screening keeps using the last stored version.\n{}",
+                        failed.join("\n")
+                    ),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
     pub async fn apply_subscription_payment(&self, payment_id: &str) -> Result<()> {
         let id = hex::decode(payment_id)?;
         let payment = self.db.get_subscription_payment(&id).await?;
@@ -3730,6 +3782,18 @@ impl Worker {
             }
             WorkJob::ApplySubscriptionPayment { payment_id } => {
                 self.apply_subscription_payment(payment_id).await?;
+            }
+            WorkJob::RefreshSanctionsLists => {
+                self.refresh_sanctions_lists().await?;
+            }
+            WorkJob::RescreenHeldDeposits => {
+                let released = self.deposits.rescreen_unscreened_deposits().await?;
+                if released > 0 {
+                    info!("Released {} deposits held only for want of screening", released);
+                }
+            }
+            WorkJob::ReleaseHeldDeposit { payment_ref } => {
+                self.deposits.release_held_deposit(payment_ref).await?;
             }
             WorkJob::SpawnVm { vm_id } => {
                 let vm = self.db.get_vm(*vm_id).await?;

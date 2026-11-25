@@ -763,6 +763,8 @@ impl SubscriptionHandler {
         payment: &SubscriptionPayment,
     ) -> Result<CompletePaymentResult> {
         self.db.subscription_payment_paid(payment).await?;
+        lnvps_api_common::sanctions::record_delegated_payment(self.db.as_ref(), payment, None)
+            .await;
         self.apply_payment(payment).await
     }
 

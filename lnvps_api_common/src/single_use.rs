@@ -215,9 +215,15 @@ mod tests {
         let replica_b: SingleUseGuard<u32> = SingleUseGuard::new("b", Duration::from_secs(60), 10);
         let ttl = Duration::from_secs(60);
         replica_a.consume(7).unwrap();
-        consume_shared(Some(&shared), "nip98", "7", ttl).await.unwrap();
+        consume_shared(Some(&shared), "nip98", "7", ttl)
+            .await
+            .unwrap();
         replica_b.consume(7).unwrap();
-        assert!(consume_shared(Some(&shared), "nip98", "7", ttl).await.is_err());
+        assert!(
+            consume_shared(Some(&shared), "nip98", "7", ttl)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -236,7 +242,9 @@ mod tests {
 
     #[tokio::test]
     async fn redis_set_is_shared_when_available() {
-        let Ok(url) = std::env::var("LNVPS_TEST_REDIS_URL") else { return };
+        let Ok(url) = std::env::var("LNVPS_TEST_REDIS_URL") else {
+            return;
+        };
         let a = RedisSeenSet::new(&url).await.unwrap();
         let b = RedisSeenSet::new(&url).await.unwrap();
         let key = format!("test-{}", std::process::id());

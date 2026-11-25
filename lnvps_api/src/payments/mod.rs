@@ -58,7 +58,13 @@ pub async fn listen_all_payments(
         }
     }));
 
-    let mut onchain_handler = OnChainPaymentHandler::new(onchain, db.clone(), sub_handler.clone());
+    let mut onchain_handler = OnChainPaymentHandler::new(onchain, db.clone(), sub_handler.clone())
+        .with_screening(crate::payments::onchain::DepositScreening::new(
+            &settings.sanctions,
+            &settings.chain_explorer,
+            db.clone(),
+            sub_handler.work_commander(),
+        ));
     ret.push(tokio::spawn(async move {
         loop {
             if let Err(e) = onchain_handler.listen().await {

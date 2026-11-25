@@ -528,6 +528,7 @@ pub struct MockChainExplorer {
     pub inputs: Arc<Mutex<HashMap<String, Vec<crate::chain::OutPoint>>>>,
     /// Spender recorded against an outpoint (`{txid}:{vout}`).
     pub outspends: Arc<Mutex<HashMap<String, crate::chain::Outspend>>>,
+    pub input_addresses: Arc<Mutex<HashMap<String, Vec<String>>>>,
     pub fail: Arc<Mutex<bool>>,
 }
 
@@ -575,6 +576,11 @@ impl crate::chain::ChainExplorer for MockChainExplorer {
                 spent_by: None,
                 confirmed: false,
             }))
+    }
+
+    async fn tx_input_addresses(&self, txid: &str) -> anyhow::Result<Option<Vec<String>>> {
+        ensure!(!*self.fail.lock().await, "explorer unavailable");
+        Ok(self.input_addresses.lock().await.get(txid).cloned())
     }
 }
 

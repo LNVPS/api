@@ -230,6 +230,16 @@ async fn admin_update_user(
 
     // Update user in database
     this.db.update_user(&user).await?;
+    if (req.billing_name.is_some()
+        || req.billing_tax_id.is_some()
+        || req.country_code.is_some()
+        || req.email.is_some())
+        && let Err(e) = crate::admin::sanctions::screener(&this)
+            .screen_user(&user)
+            .await
+    {
+        log::warn!("Sanctions screening of user {} failed: {}", user.id, e);
+    }
 
     // Handle admin role changes if requested
     if let Some(admin_role) = &req.admin_role {

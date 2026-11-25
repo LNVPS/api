@@ -174,6 +174,9 @@ impl From<anyhow::Error> for ApiError {
         if let Some(dis) = value.downcast_ref::<crate::DiscountError>() {
             return Self::bad_request(dis);
         }
+        if let Some(hold) = value.downcast_ref::<crate::sanctions::SanctionsHoldError>() {
+            return Self::forbidden(hold);
+        }
         Self::internal(value)
     }
 }

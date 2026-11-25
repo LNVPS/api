@@ -185,6 +185,7 @@ async fn handle_callback(
     if let Err(e) = sync_user_email(&this.db, uid, &profile).await {
         warn!("Failed to sync OAuth email for user {}: {}", uid, e);
     }
+    crate::api::screen_customer(this, uid).await;
 
     // Stamp the account's current session version into the token so it can be
     // revoked later by bumping that column.

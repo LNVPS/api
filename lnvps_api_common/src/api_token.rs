@@ -52,7 +52,10 @@ impl TokenScope {
 }
 
 pub fn new_api_token() -> String {
-    format!("{API_TOKEN_PREFIX}{}", hex::encode(rand::random::<[u8; 32]>()))
+    format!(
+        "{API_TOKEN_PREFIX}{}",
+        hex::encode(rand::random::<[u8; 32]>())
+    )
 }
 
 pub fn is_api_token(bearer: &str) -> bool {

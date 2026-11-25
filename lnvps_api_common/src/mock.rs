@@ -129,6 +129,9 @@ pub struct MockDb {
     pub router_bgp_routes: Arc<Mutex<HashMap<u64, RouterBgpRoute>>>,
     pub firewall_rules: Arc<Mutex<HashMap<u64, VmFirewallRule>>>,
     pub extra_allowed_ips: Arc<Mutex<Vec<VmExtraAllowedIp>>>,
+    pub sanctions_lists: Arc<Mutex<Vec<lnvps_db::SanctionsList>>>,
+    pub sanctions_matches: Arc<Mutex<Vec<lnvps_db::SanctionsMatch>>>,
+    pub payment_screenings: Arc<Mutex<Vec<lnvps_db::PaymentScreening>>>,
     /// Daily traffic rows keyed by `(vm_id, day)` — the same composite primary
     /// key the table has.
     pub vm_traffic_daily: Arc<Mutex<HashMap<(u64, NaiveDate), VmTrafficDaily>>>,
@@ -649,6 +652,9 @@ impl Default for MockDb {
             router_bgp_routes: Arc::new(Default::default()),
             firewall_rules: Arc::new(Default::default()),
             extra_allowed_ips: Arc::new(Default::default()),
+            sanctions_lists: Arc::new(Default::default()),
+            sanctions_matches: Arc::new(Default::default()),
+            payment_screenings: Arc::new(Default::default()),
             webauthn_credentials: Arc::new(Default::default()),
             api_tokens: Arc::new(Default::default()),
             apps: Arc::new(Default::default()),
@@ -1259,6 +1265,245 @@ impl LNVpsDbBase for MockDb {
             start >= now - chrono::Duration::days(days)
         });
         Ok((before - rows.len()) as u64)
+    }
+
+    async fn insert_sanctions_list(&self, list: &lnvps_db::SanctionsList) -> DbResult<u64> {
+        let mut rows = self.sanctions_lists.lock().await;
+        let id = rows.iter().map(|l| l.id).max().unwrap_or(0) + 1;
+        rows.push(lnvps_db::SanctionsList { id, ..list.clone() });
+        Ok(id)
+    }
+
+    async fn get_sanctions_list(&self, id: u64) -> DbResult<lnvps_db::SanctionsList> {
+        self.sanctions_lists
+            .lock()
+            .await
+            .iter()
+            .find(|l| l.id == id)
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("no sanctions list")))
+    }
+
+    async fn list_sanctions_lists(&self) -> DbResult<Vec<lnvps_db::SanctionsListInfo>> {
+        let rows = self.sanctions_lists.lock().await;
+        let mut latest: HashMap<String, &lnvps_db::SanctionsList> = HashMap::new();
+        for l in rows.iter() {
+            if latest.get(&l.source).is_none_or(|c| c.id < l.id) {
+                latest.insert(l.source.clone(), l);
+            }
+        }
+        let mut out: Vec<_> = latest
+            .into_values()
+            .map(|l| lnvps_db::SanctionsListInfo {
+                id: l.id,
+                source: l.source.clone(),
+                version: l.version.clone(),
+                sha256: l.sha256.clone(),
+                entry_count: l.entry_count,
+                fetched: l.fetched,
+                checked: l.checked,
+            })
+            .collect();
+        out.sort_by(|a, b| a.source.cmp(&b.source));
+        Ok(out)
+    }
+
+    async fn touch_sanctions_list(&self, id: u64) -> DbResult<()> {
+        if let Some(l) = self
+            .sanctions_lists
+            .lock()
+            .await
+            .iter_mut()
+            .find(|l| l.id == id)
+        {
+            l.checked = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn prune_sanctions_lists(&self, source: &str, keep: u64) -> DbResult<u64> {
+        let mut rows = self.sanctions_lists.lock().await;
+        let mut ids: Vec<u64> = rows
+            .iter()
+            .filter(|l| l.source == source)
+            .map(|l| l.id)
+            .collect();
+        ids.sort_unstable_by(|a, b| b.cmp(a));
+        let drop: HashSet<u64> = ids.into_iter().skip(keep as usize).collect();
+        let before = rows.len();
+        rows.retain(|l| !drop.contains(&l.id));
+        Ok((before - rows.len()) as u64)
+    }
+
+    async fn insert_sanctions_match(&self, m: &lnvps_db::SanctionsMatch) -> DbResult<Option<u64>> {
+        let mut rows = self.sanctions_matches.lock().await;
+        if rows.iter().any(|r| {
+            r.subject_hash == m.subject_hash
+                && r.list_source == m.list_source
+                && r.entry_id == m.entry_id
+        }) {
+            return Ok(None);
+        }
+        let id = rows.len() as u64 + 1;
+        rows.push(lnvps_db::SanctionsMatch {
+            id,
+            created: Utc::now(),
+            resolved_by: None,
+            resolved_at: None,
+            resolution_reason: None,
+            ..m.clone()
+        });
+        Ok(Some(id))
+    }
+
+    async fn get_sanctions_match(&self, id: u64) -> DbResult<lnvps_db::SanctionsMatch> {
+        self.sanctions_matches
+            .lock()
+            .await
+            .iter()
+            .find(|m| m.id == id)
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("no sanctions match")))
+    }
+
+    async fn list_sanctions_matches(
+        &self,
+        filter: &lnvps_db::SanctionsMatchFilter,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<lnvps_db::SanctionsMatch>, u64)> {
+        let rows = self.sanctions_matches.lock().await;
+        let mut matched: Vec<_> = rows
+            .iter()
+            .filter(|m| filter.subject.is_none_or(|s| m.subject == s))
+            .filter(|m| filter.status.is_none_or(|s| m.status == s))
+            .filter(|m| filter.open.is_none_or(|o| m.status.is_open() == o))
+            .filter(|m| filter.user_id.is_none_or(|u| m.user_id == Some(u)))
+            .filter(|m| {
+                filter
+                    .payment_ref
+                    .as_ref()
+                    .is_none_or(|p| m.payment_ref.as_ref() == Some(p))
+            })
+            .cloned()
+            .collect();
+        matched.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = matched.len() as u64;
+        Ok((
+            matched
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn resolve_sanctions_match(
+        &self,
+        id: u64,
+        status: lnvps_db::SanctionsMatchStatus,
+        admin_id: u64,
+        reason: &str,
+    ) -> DbResult<bool> {
+        let mut rows = self.sanctions_matches.lock().await;
+        let Some(m) = rows.iter_mut().find(|m| m.id == id && m.status.is_open()) else {
+            return Ok(false);
+        };
+        m.status = status;
+        m.resolved_by = Some(admin_id);
+        m.resolved_at = Some(Utc::now());
+        m.resolution_reason = Some(reason.to_string());
+        Ok(true)
+    }
+
+    async fn insert_payment_screening(&self, s: &lnvps_db::PaymentScreening) -> DbResult<bool> {
+        let mut rows = self.payment_screenings.lock().await;
+        if rows.iter().any(|r| r.payment_ref == s.payment_ref) {
+            return Ok(false);
+        }
+        let id = rows.len() as u64 + 1;
+        rows.push(lnvps_db::PaymentScreening {
+            id,
+            created: Utc::now(),
+            released_at: None,
+            ..s.clone()
+        });
+        Ok(true)
+    }
+
+    async fn get_payment_screening(
+        &self,
+        payment_ref: &str,
+    ) -> DbResult<Option<lnvps_db::PaymentScreening>> {
+        Ok(self
+            .payment_screenings
+            .lock()
+            .await
+            .iter()
+            .find(|s| s.payment_ref == payment_ref)
+            .cloned())
+    }
+
+    async fn update_payment_screening(&self, s: &lnvps_db::PaymentScreening) -> DbResult<()> {
+        if let Some(row) = self
+            .payment_screenings
+            .lock()
+            .await
+            .iter_mut()
+            .find(|r| r.payment_ref == s.payment_ref)
+        {
+            *row = lnvps_db::PaymentScreening {
+                id: row.id,
+                created: row.created,
+                released_at: row.released_at,
+                ..s.clone()
+            };
+        }
+        Ok(())
+    }
+
+    async fn list_payment_screenings(
+        &self,
+        filter: &lnvps_db::PaymentScreeningFilter,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<lnvps_db::PaymentScreening>, u64)> {
+        let rows = self.payment_screenings.lock().await;
+        let mut matched: Vec<_> = rows
+            .iter()
+            .filter(|s| {
+                filter
+                    .payment_id
+                    .as_ref()
+                    .is_none_or(|p| s.payment_id.as_ref() == Some(p))
+            })
+            .filter(|s| filter.user_id.is_none_or(|u| s.user_id == Some(u)))
+            .filter(|s| filter.held.is_none_or(|h| s.is_held() == h))
+            .cloned()
+            .collect();
+        matched.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = matched.len() as u64;
+        Ok((
+            matched
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn release_payment_screening(&self, payment_ref: &str) -> DbResult<bool> {
+        let mut rows = self.payment_screenings.lock().await;
+        let Some(s) = rows
+            .iter_mut()
+            .find(|s| s.payment_ref == payment_ref && s.is_held())
+        else {
+            return Ok(false);
+        };
+        s.released_at = Some(Utc::now());
+        Ok(true)
     }
 
     async fn list_users(&self) -> DbResult<Vec<User>> {

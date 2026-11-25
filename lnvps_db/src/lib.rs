@@ -276,6 +276,50 @@ pub trait LNVpsDbBase: Send + Sync {
     /// after receipt for a Canadian copyright notice with no proceedings started.
     async fn purge_abuse_cases(&self) -> DbResult<u64>;
 
+    async fn insert_sanctions_list(&self, list: &SanctionsList) -> DbResult<u64>;
+
+    async fn get_sanctions_list(&self, id: u64) -> DbResult<SanctionsList>;
+
+    async fn list_sanctions_lists(&self) -> DbResult<Vec<SanctionsListInfo>>;
+
+    async fn touch_sanctions_list(&self, id: u64) -> DbResult<()>;
+
+    async fn prune_sanctions_lists(&self, source: &str, keep: u64) -> DbResult<u64>;
+
+    async fn insert_sanctions_match(&self, m: &SanctionsMatch) -> DbResult<Option<u64>>;
+
+    async fn get_sanctions_match(&self, id: u64) -> DbResult<SanctionsMatch>;
+
+    async fn list_sanctions_matches(
+        &self,
+        filter: &SanctionsMatchFilter,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<SanctionsMatch>, u64)>;
+
+    async fn resolve_sanctions_match(
+        &self,
+        id: u64,
+        status: SanctionsMatchStatus,
+        admin_id: u64,
+        reason: &str,
+    ) -> DbResult<bool>;
+
+    async fn insert_payment_screening(&self, s: &PaymentScreening) -> DbResult<bool>;
+
+    async fn get_payment_screening(&self, payment_ref: &str) -> DbResult<Option<PaymentScreening>>;
+
+    async fn update_payment_screening(&self, s: &PaymentScreening) -> DbResult<()>;
+
+    async fn list_payment_screenings(
+        &self,
+        filter: &PaymentScreeningFilter,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<PaymentScreening>, u64)>;
+
+    async fn release_payment_screening(&self, payment_ref: &str) -> DbResult<bool>;
+
     /// List all users
     async fn list_users(&self) -> DbResult<Vec<User>>;
 

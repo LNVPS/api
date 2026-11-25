@@ -174,6 +174,34 @@ pub struct RouterState {
     /// Resolves client IPs to a country for VAT place-of-supply evidence.
     /// `None` when no geolocation database is configured.
     pub geoip: Option<Arc<dyn CountryResolver>>,
+    pub screener: Option<lnvps_api_common::sanctions::Screener>,
+}
+
+pub(crate) async fn screen_customer(this: &RouterState, uid: u64) {
+    let Some(screener) = &this.screener else {
+        return;
+    };
+    let result = match this.db.get_user(uid).await {
+        Ok(user) => screener.screen_user(&user).await,
+        Err(e) => Err(e.into()),
+    };
+    if let Err(e) = result {
+        log::warn!("Sanctions screening of user {} failed: {}", uid, e);
+    }
+}
+
+pub fn build_screener(
+    settings: &crate::settings::Settings,
+    db: Arc<dyn lnvps_db::LNVpsDb>,
+    work: Arc<dyn WorkCommander>,
+) -> Option<lnvps_api_common::sanctions::Screener> {
+    settings.sanctions.enabled.then(|| {
+        lnvps_api_common::sanctions::Screener::new(
+            db.clone(),
+            Arc::new(lnvps_api_common::sanctions::ListSanctionsProvider::new(db)),
+        )
+        .with_notifier(work)
+    })
 }
 
 /// Resolve a payment-method query into a concrete `(PaymentMethod, RenewMode)`.

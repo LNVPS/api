@@ -376,11 +376,17 @@ mod tests {
         e.ip = Some("203.0.113.77".into());
         let prev = c[2].hash.clone();
         let mut sealed = AuditEntry::seal(4, 2000, &prev, e);
-        assert!(verify_chain(&{
-            let mut all = c.clone();
-            all.push(sealed.clone());
-            all
-        }, None).is_ok());
+        assert!(
+            verify_chain(
+                &{
+                    let mut all = c.clone();
+                    all.push(sealed.clone());
+                    all
+                },
+                None
+            )
+            .is_ok()
+        );
         sealed.ip = Some(truncate_ip(sealed.ip.as_deref().unwrap()));
         c.push(sealed);
         assert_eq!(verify_chain(&c, None).unwrap().last_id, 4);

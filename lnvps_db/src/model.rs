@@ -2169,6 +2169,143 @@ pub struct AbuseChallenge {
     pub decided_by: Option<u64>,
 }
 
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct SanctionsList {
+    pub id: u64,
+    pub source: String,
+    pub version: String,
+    pub sha256: String,
+    pub entry_count: u32,
+    pub entries: Vec<u8>,
+    pub fetched: DateTime<Utc>,
+    pub checked: DateTime<Utc>,
+}
+
+#[derive(FromRow, Clone, Debug, Default, Serialize)]
+pub struct SanctionsListInfo {
+    pub id: u64,
+    pub source: String,
+    pub version: String,
+    pub sha256: String,
+    pub entry_count: u32,
+    pub fetched: DateTime<Utc>,
+    pub checked: DateTime<Utc>,
+}
+
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum SanctionsSubject {
+    #[default]
+    User = 0,
+    Payment = 1,
+}
+
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum SanctionsField {
+    #[default]
+    Name = 0,
+    Email = 1,
+    Entity = 3,
+    Address = 4,
+}
+
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum SanctionsMatchStatus {
+    #[default]
+    Review = 0,
+    Held = 1,
+    Cleared = 2,
+    Confirmed = 3,
+}
+
+impl SanctionsMatchStatus {
+    pub fn is_open(self) -> bool {
+        matches!(self, Self::Review | Self::Held)
+    }
+
+    pub fn blocks(self) -> bool {
+        matches!(self, Self::Held | Self::Confirmed)
+    }
+}
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct SanctionsMatch {
+    pub id: u64,
+    pub created: DateTime<Utc>,
+    pub subject: SanctionsSubject,
+    pub user_id: Option<u64>,
+    pub payment_ref: Option<String>,
+    pub field: SanctionsField,
+    pub subject_value: EncryptedString,
+    pub subject_hash: Vec<u8>,
+    pub list_id: Option<u64>,
+    pub list_source: String,
+    pub list_version: String,
+    pub list_fetched: Option<DateTime<Utc>>,
+    pub entry_id: String,
+    pub entry_name: String,
+    pub score: f32,
+    pub status: SanctionsMatchStatus,
+    pub resolved_by: Option<u64>,
+    pub resolved_at: Option<DateTime<Utc>>,
+    pub resolution_reason: Option<String>,
+}
+
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreeningMode {
+    #[default]
+    Screened = 0,
+    Delegated = 1,
+    Unscreened = 2,
+}
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct PaymentScreening {
+    pub id: u64,
+    pub payment_ref: String,
+    pub payment_id: Option<Vec<u8>>,
+    pub user_id: Option<u64>,
+    pub payment_method: PaymentMethod,
+    pub mode: ScreeningMode,
+    pub provider: String,
+    pub result: Option<String>,
+    pub held: bool,
+    pub sources: Option<String>,
+    pub address: Option<EncryptedString>,
+    pub amount_msat: Option<u64>,
+    pub created: DateTime<Utc>,
+    pub released_at: Option<DateTime<Utc>>,
+}
+
+impl PaymentScreening {
+    pub fn is_held(&self) -> bool {
+        self.held && self.released_at.is_none()
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SanctionsMatchFilter {
+    pub subject: Option<SanctionsSubject>,
+    pub status: Option<SanctionsMatchStatus>,
+    pub open: Option<bool>,
+    pub user_id: Option<u64>,
+    pub payment_ref: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PaymentScreeningFilter {
+    pub payment_id: Option<Vec<u8>>,
+    pub user_id: Option<u64>,
+    pub held: Option<bool>,
+}
+
 /// How an outbound payout reaches its recipient. Stored as a small integer; new
 /// methods are added as new variants (append-only to preserve values).
 ///
@@ -3136,6 +3273,7 @@ pub enum AdminResource {
     Abuse = 35,
     VmAddonPrice = 36,
     IpOrder = 37,
+    Sanctions = 38,
 }
 
 /// Actions that can be performed on administrative resources
@@ -3193,6 +3331,7 @@ impl Display for AdminResource {
             AdminResource::Abuse => write!(f, "abuse"),
             AdminResource::VmAddonPrice => write!(f, "vm_addon_price"),
             AdminResource::IpOrder => write!(f, "ip_order"),
+            AdminResource::Sanctions => write!(f, "sanctions"),
         }
     }
 }
@@ -3242,6 +3381,7 @@ impl FromStr for AdminResource {
             "abuse" => Ok(AdminResource::Abuse),
             "vm_addon_price" | "vm_addon_prices" => Ok(AdminResource::VmAddonPrice),
             "ip_order" | "ip_orders" => Ok(AdminResource::IpOrder),
+            "sanctions" => Ok(AdminResource::Sanctions),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -3290,6 +3430,7 @@ impl TryFrom<u16> for AdminResource {
             35 => Ok(AdminResource::Abuse),
             36 => Ok(AdminResource::VmAddonPrice),
             37 => Ok(AdminResource::IpOrder),
+            38 => Ok(AdminResource::Sanctions),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -3337,6 +3478,7 @@ impl AdminResource {
             AdminResource::Abuse,
             AdminResource::VmAddonPrice,
             AdminResource::IpOrder,
+            AdminResource::Sanctions,
         ]
     }
 }

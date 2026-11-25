@@ -422,7 +422,14 @@ async fn v1_patch_account(
         }
     }
 
+    let screen_needed = req.name.is_some()
+        || req.tax_id.is_some()
+        || req.country_code.is_some()
+        || req.email.is_some();
     this.db.update_user(&user).await?;
+    if screen_needed {
+        crate::api::screen_customer(&this, uid).await;
+    }
 
     // Queue verification email after successful save
     if let Some(token) = pending_verification {
@@ -1389,6 +1396,7 @@ async fn v1_create_custom_vm_order(
 
     // Capture place-of-supply evidence at purchase time (see capture_client_geo).
     capture_client_geo(&this, uid, client_ip).await;
+    crate::api::screen_customer(&this, uid).await;
 
     let user = this.db.get_user(uid).await?;
 
@@ -1538,6 +1546,7 @@ async fn v1_create_vm_order(
 
     // Capture place-of-supply evidence at purchase time (see capture_client_geo).
     capture_client_geo(&this, uid, client_ip).await;
+    crate::api::screen_customer(&this, uid).await;
 
     let user = this.db.get_user(uid).await?;
 
@@ -3328,6 +3337,7 @@ mod tests {
             work_sender: commander,
             feedback: None,
             geoip: None,
+            screener: None,
         }
     }
 
@@ -3382,6 +3392,110 @@ mod tests {
         );
         db.set_account_credit_auto_apply(uid, true).await.unwrap();
         assert!(ensure_hourly_order_funded(&state, &vm).await.is_ok());
+    }
+
+    async fn screened_state(db: Arc<lnvps_api_common::MockDb>) -> RouterState {
+        use lnvps_api_common::sanctions::{encode_entries, fixtures};
+        for list in [fixtures::ofac().unwrap(), fixtures::eu().unwrap()] {
+            db.insert_sanctions_list(&lnvps_db::SanctionsList {
+                source: list.source.clone(),
+                version: "fixture".into(),
+                sha256: "00".into(),
+                entry_count: list.entries.len() as u32,
+                entries: encode_entries(&list.entries).unwrap(),
+                fetched: Utc::now(),
+                checked: Utc::now(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let mut state = mock_router_state(db.clone()).await;
+        state.screener = crate::api::build_screener(&state.settings, db, state.work_sender.clone());
+        state
+    }
+
+    async fn customer(
+        db: &lnvps_api_common::MockDb,
+        seed: u8,
+        name: &str,
+        country: &str,
+        tax_id: Option<&str>,
+    ) -> (u64, u64) {
+        let uid = db.upsert_user(&[seed; 32]).await.unwrap();
+        let mut user = db.get_user(uid).await.unwrap();
+        user.billing_name = Some(name.into());
+        user.country_code = Some(country.to_string());
+        user.billing_tax_id = tax_id.map(Into::into);
+        db.update_user(&user).await.unwrap();
+        let key = db
+            .insert_user_ssh_key(&lnvps_db::UserSshKey {
+                id: 0,
+                name: "k".to_string(),
+                user_id: uid,
+                created: Default::default(),
+                key_data: "ssh-rsa AAA==".into(),
+            })
+            .await
+            .unwrap();
+        (uid, key)
+    }
+
+    async fn order(state: &RouterState, uid: u64, key: u64) -> Result<Vm, ApiError> {
+        crate::api::screen_customer(state, uid).await;
+        state
+            .sub_handler
+            .vm_provisioner()
+            .provision(uid, 1, 1, key, None)
+            .await
+            .map_err(ApiError::from)
+    }
+
+    #[tokio::test]
+    async fn a_russian_individual_can_order() {
+        let db = Arc::new(lnvps_api_common::MockDb::default());
+        let state = screened_state(db.clone()).await;
+        let (uid, key) = customer(&db, 31, "Olga Fixture Example", "RUS", None).await;
+        order(&state, uid, key).await.unwrap();
+        assert!(db.sanctions_matches.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_russian_company_order_is_held() {
+        let db = Arc::new(lnvps_api_common::MockDb::default());
+        let state = screened_state(db.clone()).await;
+        let (uid, key) = customer(&db, 32, "Fixture Widgets OOO", "RUS", Some("7700000000")).await;
+        let err = order(&state, uid, key).await.unwrap_err();
+        assert_eq!(err.code, axum::http::StatusCode::FORBIDDEN);
+        assert!(err.error.contains("compliance review"), "{}", err.error);
+        assert!(db.vms.lock().await.values().all(|v| v.user_id != uid));
+        let matches = db.sanctions_matches.lock().await;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].status, lnvps_db::SanctionsMatchStatus::Held);
+    }
+
+    #[tokio::test]
+    async fn a_near_match_customer_goes_to_review_and_can_still_order() {
+        let db = Arc::new(lnvps_api_common::MockDb::default());
+        let state = screened_state(db.clone()).await;
+        let (uid, key) = customer(&db, 33, "Ivan Petrovitch Testov", "DEU", None).await;
+        order(&state, uid, key).await.unwrap();
+        let matches = db.sanctions_matches.lock().await;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].status, lnvps_db::SanctionsMatchStatus::Review);
+    }
+
+    #[tokio::test]
+    async fn an_exact_listed_name_holds_orders_until_cleared() {
+        let db = Arc::new(lnvps_api_common::MockDb::default());
+        let state = screened_state(db.clone()).await;
+        let (uid, key) = customer(&db, 34, "Ivan Petrovich Testov", "DEU", None).await;
+        assert!(order(&state, uid, key).await.is_err());
+        let id = db.sanctions_matches.lock().await[0].id;
+        db.resolve_sanctions_match(id, lnvps_db::SanctionsMatchStatus::Cleared, 1, "fixture")
+            .await
+            .unwrap();
+        order(&state, uid, key).await.unwrap();
     }
 
     /// The LNURL top-up helper books a Lightning top-up for the VM owner, so a
