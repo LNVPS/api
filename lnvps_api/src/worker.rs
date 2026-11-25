@@ -3786,6 +3786,12 @@ impl Worker {
             WorkJob::RefreshSanctionsLists => {
                 self.refresh_sanctions_lists().await?;
             }
+            WorkJob::RescreenHeldDeposits => {
+                let released = self.deposits.rescreen_unscreened_deposits().await?;
+                if released > 0 {
+                    info!("Released {} deposits held only for want of screening", released);
+                }
+            }
             WorkJob::ReleaseHeldDeposit { payment_ref } => {
                 self.deposits.release_held_deposit(payment_ref).await?;
             }

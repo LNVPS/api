@@ -432,6 +432,9 @@ async fn main() -> Result<(), Error> {
                 worker
                     .spawn_job_interval(WorkJob::RefreshSanctionsLists, Duration::from_secs(86400)),
             );
+            tasks.push(
+                worker.spawn_job_interval(WorkJob::RescreenHeldDeposits, Duration::from_secs(600)),
+            );
         }
         tasks.push(worker.spawn_job_interval(WorkJob::CheckIpOrders, Duration::from_secs(300)));
         tasks.push(worker.spawn_handler_loop());

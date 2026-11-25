@@ -266,6 +266,47 @@ being held forever.
 With `none`, or a self-hosted esplora that is unreachable, deposits still settle
 normally; a replaced one just keeps blocking deletion of the VM it was for.
 
+The explorer is also where sanctions screening reads the source addresses of an
+on-chain deposit (see below). With `none` every on-chain deposit is held for
+admin review.
+
+### Sanctions screening
+
+```yaml
+# On by default. These are the defaults.
+sanctions:
+  enabled: true
+  ofac-url: "https://sanctionslistservice.ofac.treas.gov/api/PublicationPreview/exports"
+  eu-url: "https://webgate.ec.europa.eu/fsd/fsf/public/files/csvFullSanctionsList_1_1/content?token=dG9rZW4tMjAxNw"
+```
+
+The worker fetches the OFAC SDN list (`SDN.CSV`, `ALT.CSV`, `SDN_COMMENTS.CSV`
+under `ofac-url`) and the EU consolidated financial sanctions list (`eu-url`)
+once a day and stores each new version with its hash and fetch time. The last
+three versions per list are kept. A failed fetch keeps the previous version and
+sends an admin notification.
+
+- On-chain deposits: the source addresses of the paying transaction are
+  checked against the listed crypto addresses before anything is credited. A
+  hit holds the deposit (not credited, not refunded). A deposit whose sources
+  cannot be read, or that arrives before any list is loaded, is held too and
+  rescreened every 10 minutes.
+- Customers: billing name and email are screened on signup, on any change to
+  billing details, and before each new VM order. An exact or normalised exact
+  name or email match holds new VM orders; a near match goes to review with a
+  score and blocks nothing. A customer with a tax id (a legal entity) whose
+  country or VAT prefix is Russia or Belarus is held. Country alone never
+  holds an individual. Existing VMs are never touched.
+- Lightning, Revolut, Stripe, PayPal, the payment gateway and FixedFloat rely
+  on the provider's own screening; each settled payment records that the check
+  was delegated, and for Revolut what Revolut returned.
+
+Every match is in `/api/admin/v1/sanctions/matches`, where an admin clears or
+confirms it with a reason. Clearing the last open match on a held deposit
+credits it exactly once.
+
+Set `enabled: false` to switch screening off entirely.
+
 ### DNS — Cloudflare (optional)
 
 ```yaml

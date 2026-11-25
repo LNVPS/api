@@ -81,10 +81,19 @@ impl DepositScreening {
         db: Arc<dyn LNVpsDb>,
         work: Arc<dyn lnvps_api_common::WorkCommander>,
     ) -> Option<Self> {
-        config.enabled.then(|| Self {
+        if !config.enabled {
+            return None;
+        }
+        let explorer = crate::chain::build_chain_explorer(explorer);
+        if explorer.is_none() {
+            warn!(
+                "Sanctions screening is on but no chain explorer is configured: on-chain deposits will be held until an admin reviews them"
+            );
+        }
+        Some(Self {
             screener: Screener::new(db.clone(), Arc::new(ListSanctionsProvider::new(db)))
                 .with_notifier(work),
-            explorer: crate::chain::build_chain_explorer(explorer),
+            explorer,
         })
     }
 
