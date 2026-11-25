@@ -186,6 +186,7 @@ impl VmProvisioner {
         host_id: Option<u64>,
     ) -> Result<Vm> {
         let user = self.db.get_user(user_id).await?;
+        lnvps_api_common::sanctions::ensure_orders_allowed(self.db.as_ref(), user.id).await?;
         let template = self.db.get_vm_template(template_id).await?;
         let image = self.db.get_os_image(image_id).await?;
         let ssh_key = self.db.get_user_ssh_key(ssh_key_id).await?;
@@ -312,6 +313,7 @@ impl VmProvisioner {
         ref_code: Option<String>,
     ) -> Result<Vm> {
         let user = self.db.get_user(user_id).await?;
+        lnvps_api_common::sanctions::ensure_orders_allowed(self.db.as_ref(), user.id).await?;
         let pricing = self.db.get_custom_pricing(template.pricing_id).await?;
         let image = self.db.get_os_image(image_id).await?;
         let ssh_key = self.db.get_user_ssh_key(ssh_key_id).await?;

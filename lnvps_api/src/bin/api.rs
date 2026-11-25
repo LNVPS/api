@@ -660,6 +660,11 @@ async fn main() -> Result<(), Error> {
                     ),
                 ))
                 .with_state(RouterState {
+                    screener: lnvps_api::api::build_screener(
+                        &settings,
+                        db.clone(),
+                        worker.commander(),
+                    ),
                     db,
                     state: status,
                     sub_handler,

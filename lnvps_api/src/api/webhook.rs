@@ -195,6 +195,7 @@ mod tests {
             work_sender: commander,
             feedback: None,
             geoip: None,
+            screener: None,
         }
     }
 
