@@ -4245,6 +4245,8 @@ pub struct AdminSubscriptionPaymentInfo {
     /// The swap order behind a `fixedfloat` payment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub swap: Option<AdminSwapInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub screening: Vec<crate::admin::sanctions::AdminPaymentScreening>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -4313,6 +4315,7 @@ impl AdminSubscriptionPaymentInfo {
             processing_fee: payment.processing_fee,
             discount: None,
             swap,
+            screening: vec![],
         }
     }
 
@@ -4322,6 +4325,14 @@ impl AdminSubscriptionPaymentInfo {
     /// discounts in one query and hand each row its own.
     pub fn with_discount(mut self, discount: Option<AdminPaymentDiscountInfo>) -> Self {
         self.discount = discount;
+        self
+    }
+
+    pub fn with_screening(
+        mut self,
+        screening: Vec<crate::admin::sanctions::AdminPaymentScreening>,
+    ) -> Self {
+        self.screening = screening;
         self
     }
 
@@ -4351,6 +4362,7 @@ impl AdminSubscriptionPaymentInfo {
             processing_fee: payment.processing_fee,
             discount: None,
             swap,
+            screening: vec![],
         }
     }
 }
