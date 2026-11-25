@@ -1,17 +1,36 @@
 use super::{RenewMode, SubscriptionHandler};
 use anyhow::{Result, bail};
 use chrono::{Datelike, Utc};
-use lnvps_api_common::{GatewaySavedCharge, OffSessionRenewals};
+use lnvps_api_common::{
+    GatewayCardProvider, GatewayCardRequest, GatewaySavedCharge, OffSessionRenewals,
+};
 use lnvps_db::{
-    PaymentMethod, RenewalSource, SubscriptionPayment, SubscriptionPaymentType, UserPaymentMethod,
+    PaymentMethod, RenewalSource, SubscriptionPayment, SubscriptionPaymentType, User,
+    UserPaymentMethod,
 };
 use log::info;
+
+pub(crate) const CARD_EXPIRE_SECS: u32 = 3600;
 
 pub(crate) const GATEWAY_CARD_EXTERNAL_DATA: &str = r#"{"token":"","session_id":""}"#;
 
 pub(crate) struct GatewayCardCharge {
     pub payment_id: Vec<u8>,
     pub external_id: String,
+}
+
+pub(crate) struct GatewayCardOrder {
+    pub payment_id: Vec<u8>,
+    pub external_id: String,
+    pub external_data: String,
+}
+
+fn card_provider(method: PaymentMethod) -> Option<GatewayCardProvider> {
+    match method {
+        PaymentMethod::Revolut => Some(GatewayCardProvider::Revolut),
+        PaymentMethod::Stripe => Some(GatewayCardProvider::Stripe),
+        _ => None,
+    }
 }
 
 fn provider_name(method: PaymentMethod) -> Option<&'static str> {
@@ -23,6 +42,73 @@ fn provider_name(method: PaymentMethod) -> Option<&'static str> {
 }
 
 impl SubscriptionHandler {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn gateway_card_order(
+        &self,
+        company_id: u64,
+        method: PaymentMethod,
+        mode: &RenewMode,
+        user: &User,
+        subscription_id: u64,
+        payment_type: SubscriptionPaymentType,
+        amount: u64,
+        tax: u64,
+        currency: &str,
+        description: String,
+    ) -> Result<Option<GatewayCardOrder>> {
+        let (RenewMode::Interactive { save_card }, Some(provider)) = (mode, card_provider(method))
+        else {
+            return Ok(None);
+        };
+        let Some(gateway) = self.card_gateway_for(company_id, method).await? else {
+            return Ok(None);
+        };
+        let has_saved_method = self
+            .db()
+            .list_user_payment_methods(user.id, Some(provider.as_str()))
+            .await
+            .map(|m| m.iter().any(|pm| pm.enabled))
+            .unwrap_or(false);
+        let email: String = user.email.clone().into();
+        let customer_email = (!email.is_empty()).then_some(email);
+        let save_card = *save_card
+            && !has_saved_method
+            && payment_type != SubscriptionPaymentType::Upgrade
+            && customer_email.is_some();
+        let payment_id: [u8; 32] = rand::random();
+        let (success_url, cancel_url) = self.card_return_urls();
+        let attempt = gateway
+            .create_card_attempt(GatewayCardRequest {
+                payment_id: payment_id.to_vec(),
+                provider,
+                amount,
+                currency: currency.to_string(),
+                tax,
+                description,
+                expires_in_secs: CARD_EXPIRE_SECS,
+                customer_ref: user.id.to_string(),
+                customer_email,
+                save_card,
+                success_url: Some(success_url),
+                cancel_url: Some(cancel_url),
+                metadata: serde_json::json!({
+                    "subscription_id": subscription_id,
+                    "payment_type": format!("{payment_type:?}"),
+                }),
+            })
+            .await?;
+        Ok(Some(GatewayCardOrder {
+            payment_id: payment_id.to_vec(),
+            external_id: attempt.external_id,
+            external_data: attempt.external_data,
+        }))
+    }
+
+    fn card_return_urls(&self) -> (String, String) {
+        let base = self.public_url.trim_end_matches('/').to_string();
+        (base.clone(), base)
+    }
+
     pub(crate) async fn gateway_saved_method(
         &self,
         company_id: u64,

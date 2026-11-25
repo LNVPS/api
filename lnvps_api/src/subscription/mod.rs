@@ -40,6 +40,7 @@ use std::time::{Duration, Instant};
 use crate::swap::{SwapOrder, SwapOrderRequest, SwapProvider};
 pub use crypto::OnChainAddress;
 use crypto::{CryptoContext, ONCHAIN_EXPIRE_SECS, SWAP_EXPIRE_SECS};
+use gateway_card::CARD_EXPIRE_SECS;
 
 mod app;
 mod crypto;
@@ -316,6 +317,7 @@ pub struct SubscriptionHandler {
     /// Global default cap (days) on how far in advance a subscription may be
     /// prepaid/renewed. Used when a company's own `max_prepay_days` is 0.
     max_prepay_days: u16,
+    public_url: String,
 }
 
 impl SubscriptionHandler {
@@ -332,6 +334,7 @@ impl SubscriptionHandler {
         vm_state_cache: VmStateCache,
     ) -> Result<Self> {
         let max_prepay_days = settings.max_prepay_days;
+        let public_url = settings.public_url.clone();
         Ok(Self {
             revolut,
             swap: None,
@@ -351,6 +354,7 @@ impl SubscriptionHandler {
             vm_state_cache,
             saved_payment_settle_timeout: SAVED_PAYMENT_SETTLE_TIMEOUT,
             max_prepay_days,
+            public_url,
         })
     }
 
@@ -1724,6 +1728,54 @@ impl SubscriptionHandler {
                 refunded_payment_id: None,
             });
         }
+        if matches!(method, PaymentMethod::Revolut | PaymentMethod::Stripe)
+            && let Some(order) = self
+                .gateway_card_order(
+                    subscription.company_id,
+                    method,
+                    mode,
+                    user,
+                    subscription_id,
+                    payment_type,
+                    converted_amount + tax + processing_fee - credit_covered,
+                    tax,
+                    &converted_currency.to_string(),
+                    format!("Subscription {payment_type:?}: {}", subscription.name),
+                )
+                .await?
+        {
+            return Ok(SubscriptionPayment {
+                renewal_source: Some(source),
+                id: order.payment_id,
+                subscription_id,
+                user_id: subscription.user_id,
+                created: Utc::now(),
+                expires: Utc::now().add(Duration::from_secs(CARD_EXPIRE_SECS as u64)),
+                amount: converted_amount,
+                currency: converted_currency.to_string(),
+                payment_method: method,
+                payment_type,
+                external_data: order.external_data.into(),
+                external_id: Some(order.external_id),
+                is_paid: false,
+                rate,
+                time_value: if time_value > 0 {
+                    Some(time_value)
+                } else {
+                    None
+                },
+                metadata: None,
+                tax,
+                processing_fee,
+                paid_at: None,
+                tax_rate: tax_summary.rate,
+                tax_country_code: tax_summary.country_code.clone(),
+                tax_treatment: tax_summary.treatment.clone(),
+                tax_evidence,
+                tax_breakdown,
+                refunded_payment_id: None,
+            });
+        }
         Ok(match method {
             PaymentMethod::Gateway => bail!("Gateway is not a payment method"),
             PaymentMethod::Lightning => {
@@ -2532,6 +2584,52 @@ impl SubscriptionHandler {
         }
         let credit_covered = credit_amount(credit);
         let priced_company_id = self.db.get_subscription(subscription_id).await?.company_id;
+        if matches!(method, PaymentMethod::Revolut | PaymentMethod::Stripe) {
+            let user = self.db.get_user(user_id).await?;
+            if let Some(order) = self
+                .gateway_card_order(
+                    priced_company_id,
+                    method,
+                    mode,
+                    &user,
+                    subscription_id,
+                    payment_type,
+                    p.amount + p.tax + p.processing_fee - credit_covered,
+                    p.tax,
+                    &p.currency.to_string(),
+                    desc.clone(),
+                )
+                .await?
+            {
+                return Ok(SubscriptionPayment {
+                    renewal_source: Some(RenewalSource::Manual),
+                    id: order.payment_id,
+                    subscription_id,
+                    user_id,
+                    created: Utc::now(),
+                    expires: Utc::now().add(Duration::from_secs(CARD_EXPIRE_SECS as u64)),
+                    amount: p.amount,
+                    currency: p.currency.to_string(),
+                    payment_method: method,
+                    payment_type,
+                    external_data: order.external_data.into(),
+                    external_id: Some(order.external_id),
+                    is_paid: false,
+                    rate: p.rate.rate,
+                    time_value: Some(p.time_value),
+                    metadata,
+                    tax: p.tax,
+                    processing_fee: p.processing_fee,
+                    paid_at: None,
+                    tax_rate: tax_summary.rate,
+                    tax_country_code: tax_summary.country_code.clone(),
+                    tax_treatment: tax_summary.treatment.clone(),
+                    tax_evidence,
+                    tax_breakdown,
+                    refunded_payment_id: None,
+                });
+            }
+        }
         Ok(match method {
             PaymentMethod::Gateway => bail!("Gateway is not a payment method"),
             PaymentMethod::Lightning => {
