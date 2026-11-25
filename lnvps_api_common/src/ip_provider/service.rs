@@ -63,14 +63,21 @@ pub async fn audit_ip_order(
         .insert_ip_order_audit(ip_order_id, event, detail, actor_user_id)
         .await?;
     let entry = lnvps_db::NewAuditEntry::new(
-        if actor_user_id.is_some() { "user" } else { "system" },
+        if actor_user_id.is_some() {
+            "user"
+        } else {
+            "system"
+        },
         actor_user_id,
         &format!("ip_order.{event}"),
     )
     .target("ip_order", ip_order_id)
     .change(None, detail.map(str::to_string));
     if let Err(e) = crate::record_audit(db, entry).await {
-        log::warn!("ip order audit {id} not mirrored to the audit log: {}", e.error);
+        log::warn!(
+            "ip order audit {id} not mirrored to the audit log: {}",
+            e.error
+        );
     }
     Ok(id)
 }
@@ -116,8 +123,7 @@ pub async fn create_ip_order(db: &dyn LNVpsDb, req: NewIpOrder) -> Result<(IpOrd
         ..Default::default()
     };
     order.id = db.insert_ip_order(&order).await?;
-    audit_ip_order(db, order.id, "requested", None, req.requested_by)
-        .await?;
+    audit_ip_order(db, order.id, "requested", None, req.requested_by).await?;
     Ok((order, true))
 }
 
@@ -137,8 +143,7 @@ pub async fn approve_ip_order(db: &dyn LNVpsDb, id: u64, admin_user_id: u64) -> 
     order.approved_by = Some(admin_user_id);
     order.approved_at = Some(Utc::now());
     db.update_ip_order(&order).await?;
-    audit_ip_order(db, id, "approved", None, Some(admin_user_id))
-        .await?;
+    audit_ip_order(db, id, "approved", None, Some(admin_user_id)).await?;
     Ok(order)
 }
 
@@ -154,8 +159,7 @@ pub async fn reject_ip_order(db: &dyn LNVpsDb, id: u64, admin_user_id: u64) -> R
             order.state
         );
     }
-    audit_ip_order(db, id, "rejected", None, Some(admin_user_id))
-        .await?;
+    audit_ip_order(db, id, "rejected", None, Some(admin_user_id)).await?;
     Ok(db.get_ip_order(id).await?)
 }
 
@@ -205,8 +209,7 @@ impl IpOrderService {
     }
 
     async fn audit(&self, order: &IpOrder, event: &str, detail: Option<&str>) {
-        if let Err(e) = audit_ip_order(self.db.as_ref(), order.id, event, detail, None).await
-        {
+        if let Err(e) = audit_ip_order(self.db.as_ref(), order.id, event, detail, None).await {
             error!("Failed to write ip order audit for {}: {}", order.id, e);
         }
     }

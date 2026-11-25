@@ -410,7 +410,7 @@ pub fn parse_gateway_event_with(
     tolerance_seconds: i64,
 ) -> Result<GatewayEvent> {
     let value = verify_webhook(body, signature, secret, tolerance_seconds)
-    .map_err(|e| anyhow::anyhow!("invalid gateway webhook: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("invalid gateway webhook: {e}"))?;
     let text =
         |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let payment = value.pointer("/data/payment");

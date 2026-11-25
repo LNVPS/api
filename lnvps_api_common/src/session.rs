@@ -385,7 +385,9 @@ pub fn verify_step_up_token(token: &str, uid: u64) -> bool {
     let Ok(claims) = serde_json::from_slice::<ChallengeClaims>(&raw) else {
         return false;
     };
-    claims.purpose == STEP_UP_PURPOSE && claims.payload == uid.to_string() && now_secs() < claims.exp
+    claims.purpose == STEP_UP_PURPOSE
+        && claims.payload == uid.to_string()
+        && now_secs() < claims.exp
 }
 
 /// Claims for a short-lived, path-scoped, single-use websocket/HTML auth ticket.

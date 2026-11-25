@@ -1058,11 +1058,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
         limit: u64,
         offset: u64,
     ) -> DbResult<(Vec<crate::SanctionsMatch>, u64)> {
-        let clause = "from sanctions_match where (? is null or status = ?) and (? is null or (status in (0, 1)) = ?) and (? is null or user_id = ?) and (? is null or payment_ref = ?)";
+        let clause = "from sanctions_match where (? is null or subject = ?) and (? is null or status = ?) and (? is null or (status in (0, 1)) = ?) and (? is null or user_id = ?) and (? is null or payment_ref = ?)";
         let status = filter.status;
         let rows = sqlx::query_as(&format!(
             "select * {clause} order by id desc limit ? offset ?"
         ))
+        .bind(filter.subject)
+        .bind(filter.subject)
         .bind(status)
         .bind(status)
         .bind(filter.open)
@@ -1076,6 +1078,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .fetch_all(&self.db)
         .await?;
         let total: i64 = sqlx::query_scalar(&format!("select count(*) {clause}"))
+            .bind(filter.subject)
+            .bind(filter.subject)
             .bind(status)
             .bind(status)
             .bind(filter.open)

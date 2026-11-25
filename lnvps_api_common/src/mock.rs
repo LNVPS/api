@@ -1270,10 +1270,7 @@ impl LNVpsDbBase for MockDb {
     async fn insert_sanctions_list(&self, list: &lnvps_db::SanctionsList) -> DbResult<u64> {
         let mut rows = self.sanctions_lists.lock().await;
         let id = rows.iter().map(|l| l.id).max().unwrap_or(0) + 1;
-        rows.push(lnvps_db::SanctionsList {
-            id,
-            ..list.clone()
-        });
+        rows.push(lnvps_db::SanctionsList { id, ..list.clone() });
         Ok(id)
     }
 
@@ -1338,10 +1335,7 @@ impl LNVpsDbBase for MockDb {
         Ok((before - rows.len()) as u64)
     }
 
-    async fn insert_sanctions_match(
-        &self,
-        m: &lnvps_db::SanctionsMatch,
-    ) -> DbResult<Option<u64>> {
+    async fn insert_sanctions_match(&self, m: &lnvps_db::SanctionsMatch) -> DbResult<Option<u64>> {
         let mut rows = self.sanctions_matches.lock().await;
         if rows.iter().any(|r| {
             r.subject_hash == m.subject_hash
@@ -1381,6 +1375,7 @@ impl LNVpsDbBase for MockDb {
         let rows = self.sanctions_matches.lock().await;
         let mut matched: Vec<_> = rows
             .iter()
+            .filter(|m| filter.subject.is_none_or(|s| m.subject == s))
             .filter(|m| filter.status.is_none_or(|s| m.status == s))
             .filter(|m| filter.open.is_none_or(|o| m.status.is_open() == o))
             .filter(|m| filter.user_id.is_none_or(|u| m.user_id == Some(u)))

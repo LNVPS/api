@@ -2208,7 +2208,6 @@ pub enum SanctionsField {
     #[default]
     Name = 0,
     Email = 1,
-    Country = 2,
     Entity = 3,
     Address = 4,
 }
@@ -2293,6 +2292,7 @@ impl PaymentScreening {
 
 #[derive(Clone, Debug, Default)]
 pub struct SanctionsMatchFilter {
+    pub subject: Option<SanctionsSubject>,
     pub status: Option<SanctionsMatchStatus>,
     pub open: Option<bool>,
     pub user_id: Option<u64>,

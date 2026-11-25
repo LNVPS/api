@@ -1,0 +1,6 @@
+﻿fileGenerationDate;Entity_LogicalId;Entity_EU_ReferenceNumber;Entity_SubjectType;Entity_SubjectType_ClassificationCode;NameAlias_WholeName;NameAlias_Remark;Address_ContactInfo;Address_CountryIso2Code
+20/11/2026;7001;EU.9001.1;E;enterprise;Fixture Exchange LLC;;;RU
+20/11/2026;7001;EU.9001.1;E;enterprise;OOO Fixture Exchange;"Place of registration: Moscow\nKnown blockchain wallet addresses:\nBTC: bc1qeufxture00000000000000000000000000000000\n3FxtrEuSecondAddr33333333333333333\nETH: 0x0000000000000000000000000000000000000001";;RU
+20/11/2026;7001;EU.9001.1;E;enterprise;;;"(Website: example.ru)";RU
+20/11/2026;7002;EU.9002.2;P;person;Jane Fixture Doe;;"email: eu.listed@example.org";
+20/11/2026;7003;EU.9003.3;P;person;Aleksandr Ivanovich Fixturov;;;RU
