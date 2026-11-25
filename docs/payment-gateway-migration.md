@@ -25,6 +25,61 @@ tax treatment) map to gateway `line_items`: name, quantity, unit amount and
 since the frozen `tax_breakdown` on `subscription_payment` stays the source of
 truth for receipts. Sending lines is stage 3 work, when card receipts need them.
 
+## Customer visible parity audit
+
+The customer must see the same thing whether a payment runs in process or through the gateway. Verdicts: OK (identical, covered by `subscription/gateway_contract_tests.rs`), FIXED (differed, changed here), OPEN (needs something outside this repo).
+
+### a. Payment data shapes
+
+| Method | In process | Gateway | Verdict |
+|---|---|---|---|
+| Lightning | bolt11 string in `external_data` | `details.bolt11` stored the same way | OK |
+| Revolut | `{"token"}` from the order | `details.widget.token` stored as `{"token"}` | FIXED: card attempts now go through `create_card_attempt` |
+| Stripe | not creatable in process ("not implemented") | `details.session_id` stored as `{"session_id"}` | FIXED: new, same `ApiPaymentData::Stripe` shape |
+| On-chain | address string | `details.address`, `external_id` `pgw:<id>` | OK, `pgw:` ids are filtered out of `outpoint` by `deposit_outpoint` |
+| FixedFloat | `SwapData` JSON | `details` mapped into `SwapData` | OK, API shows `{coin, address, amount}` |
+| Credit | marker, no provider object | never reaches the gateway | OK |
+
+The gateway `checkout_url` is dropped when the attempt is stored. It is never put in `external_data`, never returned and never used.
+
+### b. Ids, expiry, polling, 0-conf
+
+- Payment ids are random 32 bytes created by LNVPS and sent as the gateway `reference`. The `pgw:` `external_id` is internal and never serialised. OK.
+- Expiry: Lightning 600 s, on-chain 3600 s, FixedFloat 1800 s are sent as `expires_in` and the LNVPS row keeps its own clock. Card payments now use 3600 s, the same as the in process Revolut order. OK.
+- Status polling reads the LNVPS row, settled by the signed webhook. The client polls the same endpoints. OK.
+- "Payment received, waiting for confirmation": the in process path sets `outpoint` at the first mempool sighting. A gateway on-chain payment has no LNVPS outpoint until the gateway reports it. OPEN: the gateway attempt `progress` (received, confirmed) is not mirrored into `outpoint` yet, so a 0-conf gateway deposit shows no outpoint until `payment.paid`. Tracked as a follow up.
+
+### c. Save card and saved card list
+
+- The `save_card` opt-in is honoured with the same rules as in process (opt in, no usable saved method yet, not an upgrade) and sent as `save_method`. The gateway needs the customer email to save a card, so a user with no email gets a plain card payment, as the in process path also fell back to an order. OK.
+- `PaymentMethodResponse` exposes provider, name, brand, last four and expiry only. `gateway_method_id` is never serialised. OK.
+- Importing existing Stripe and Revolut methods into the gateway is still blocked on the client import call. OPEN, unchanged.
+
+### d. Receipts and emails
+
+- Line items: card attempts send one line item carrying the net amount and the tax amount, so the gateway total equals the charge and the tax matches the frozen LNVPS breakdown. Per subscription line items stay stage 3 work. The LNVPS invoice remains the receipt customers get.
+- Gateway emails: the only customer facing mail in the gateway is `send_receipt_mail`, which needs `customer_email` on the payment. At the pinned revision nothing calls it, and LNVPS sends `customer_email` only on a save card attempt (Revolut needs it to create the customer), never on a plain payment. Plain card, Lightning, on-chain and FixedFloat payments carry no email. OPEN: when the gateway starts calling `send_receipt_mail`, a save card payment would email the customer, so the tenant needs a receipts off switch (gateway issue to file) and the sandbox run must confirm no mail and that Stripe does not send its own receipt (an account setting on the Stripe side).
+- Operator emails (webhook abandoned, refund failed, provider failing) go to tenant owners only.
+
+### e. Failure messages
+
+- A declined card arrives as `attempt.failed` and the text is unchanged: `Your card payment failed: <reason>.\nPlease try another payment method.` OK.
+- Errors from the gateway client (`gateway create_attempt failed`) reach the customer through `ApiError::internal`, which returns "An internal error occurred" unless verbose errors are on (admin API only). Test `customer_text_never_names_the_gateway` covers a failing gateway. OK.
+
+### f. Clients
+
+No API field, enum variant or type changed, so the web app and the Nostr and API clients need no change. The only edit outside the payment code is making `api::model` crate visible so the contract test can serialise real responses.
+
+### g. Return urls
+
+Card attempts set `success_url` and `cancel_url` to the LNVPS `public-url`. The gateway checks them against the project allowed origins, so the LNVPS origin must be listed on the gateway project. Never a gateway page.
+
+### Open items
+
+1. Sandbox run against the sandbox gateway: not done, no sandbox key exists yet. Steps: enable a gateway row for revolut and stripe, buy with each, check the widget opens, the `external_id` starts `pgw:`, no email arrives from the gateway, the webhook settles once.
+2. Mirror gateway on-chain progress into `outpoint` (see b).
+3. Add the LNVPS origin to the gateway project allowed origins.
+
 ## Stages
 
 1. A `PaymentGateway` trait in `lnvps_api_common::gateway` with `InProcessGateway` (the LND node, default) and `GatewayClient` (the gateway API). Chosen per method by config. Done.
