@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use payment_gateway_client::{CreateAttempt, CreatePayment, Gateway, RefundInput, verify_webhook};
+use payment_gateway_client::{
+    CreateAttempt, CreatePayment, Gateway, LineItemInput, RefundInput, verify_webhook,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -116,6 +118,44 @@ pub struct GatewayImportMethod {
     pub external_id: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayCardProvider {
+    Revolut,
+    Stripe,
+}
+
+impl GatewayCardProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            GatewayCardProvider::Revolut => "revolut",
+            GatewayCardProvider::Stripe => "stripe",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct GatewayCardRequest {
+    pub payment_id: Vec<u8>,
+    pub provider: GatewayCardProvider,
+    pub amount: u64,
+    pub currency: String,
+    pub tax: u64,
+    pub description: String,
+    pub expires_in_secs: u32,
+    pub customer_ref: String,
+    pub customer_email: Option<String>,
+    pub save_card: bool,
+    pub success_url: Option<String>,
+    pub cancel_url: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayCardAttempt {
+    pub external_id: String,
+    pub external_data: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GatewayEvent {
     pub event_id: String,
@@ -148,6 +188,10 @@ pub trait PaymentGateway: Send + Sync {
         _destination: Option<&str>,
     ) -> Result<GatewayRefund> {
         bail!("refunds are not supported by this gateway")
+    }
+
+    async fn create_card_attempt(&self, _req: GatewayCardRequest) -> Result<GatewayCardAttempt> {
+        bail!("card payments are not supported by this gateway")
     }
 
     async fn charge_saved_method(&self, _req: GatewaySavedCharge) -> Result<GatewayCharge> {
@@ -272,6 +316,48 @@ impl PaymentGateway for GatewayClient {
         Ok(())
     }
 
+    async fn create_card_attempt(&self, req: GatewayCardRequest) -> Result<GatewayCardAttempt> {
+        let reference = hex::encode(&req.payment_id);
+        let tax = req.tax.min(req.amount);
+        let mut input = CreatePayment::new(0, &req.currency).reference(&reference);
+        input.line_items = Some(vec![LineItemInput {
+            tax_amount: Some(tax),
+            ..LineItemInput::new(&req.description, req.amount - tax)
+        }]);
+        input.expires_in = Some(req.expires_in_secs as i64);
+        input.description = Some(req.description.clone());
+        input.customer_ref = Some(req.customer_ref.clone());
+        input.customer_email = req.customer_email.clone();
+        input.metadata = Some(req.metadata.clone());
+        input.methods = Some(vec![req.provider.as_str().to_string()]);
+        input.success_url = req.success_url.clone();
+        input.cancel_url = req.cancel_url.clone();
+        let payment = self
+            .client
+            .create_payment_with_key(&input, &reference)
+            .await
+            .context("gateway create_payment failed")?;
+        let mut attempt = CreateAttempt::new(req.provider.as_str());
+        attempt.save_method = req.save_card;
+        let payment = self
+            .client
+            .create_attempt(&payment.id, &attempt)
+            .await
+            .context("gateway create_attempt failed")?;
+        let details = payment
+            .attempts
+            .iter()
+            .find(|a| a.method == req.provider.as_str())
+            .map(|a| a.details.clone())
+            .unwrap_or_default();
+        let external_data = card_external_data(req.provider, &details)
+            .with_context(|| format!("gateway payment {} has no card details", payment.id))?;
+        Ok(GatewayCardAttempt {
+            external_id: format!("{GATEWAY_EXTERNAL_ID_PREFIX}{}", payment.id),
+            external_data,
+        })
+    }
+
     async fn charge_saved_method(&self, req: GatewaySavedCharge) -> Result<GatewayCharge> {
         let reference = hex::encode(&req.payment_id);
         let mut input = CreatePayment::new(req.amount, &req.currency).reference(&reference);
@@ -380,6 +466,27 @@ impl PaymentGateway for GatewayClient {
     }
 }
 
+pub fn card_external_data(
+    provider: GatewayCardProvider,
+    details: &serde_json::Value,
+) -> Option<String> {
+    let text = |v: Option<&serde_json::Value>| {
+        v.and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Some(match provider {
+        GatewayCardProvider::Revolut => {
+            let token = text(details.pointer("/widget/token"))?;
+            serde_json::json!({ "token": token }).to_string()
+        }
+        GatewayCardProvider::Stripe => {
+            let session_id = text(details.get("session_id"))?;
+            serde_json::json!({ "session_id": session_id }).to_string()
+        }
+    })
+}
+
 pub fn is_gateway_payment(external_id: Option<&str>) -> bool {
     external_id.is_some_and(|e| e.starts_with(GATEWAY_EXTERNAL_ID_PREFIX))
 }
@@ -447,6 +554,7 @@ pub struct FakeGateway {
     pub refunds: Mutex<Vec<(String, Option<u64>, Option<String>)>>,
     pub fail_refunds: Mutex<bool>,
     pub charge_leaves_pending: Mutex<bool>,
+    pub cards: Mutex<Vec<GatewayCardRequest>>,
     ids: Mutex<HashMap<Vec<u8>, String>>,
 }
 
@@ -488,6 +596,34 @@ impl PaymentGateway for FakeGateway {
         }
         self.cancelled.lock().unwrap().push(id.to_string());
         Ok(())
+    }
+
+    async fn create_card_attempt(&self, req: GatewayCardRequest) -> Result<GatewayCardAttempt> {
+        if *self.fail.lock().unwrap() {
+            bail!("gateway unavailable");
+        }
+        let hexid = hex::encode(&req.payment_id[..4.min(req.payment_id.len())]);
+        let details = match req.provider {
+            GatewayCardProvider::Revolut => serde_json::json!({
+                "checkout_url": format!("https://gw.example/pay/{hexid}"),
+                "widget": {"provider": "revolut", "token": format!("fake-token-{hexid}"), "mode": "sandbox", "email": req.customer_email},
+            }),
+            GatewayCardProvider::Stripe => serde_json::json!({
+                "checkout_url": format!("https://gw.example/pay/{hexid}"),
+                "session_id": format!("cs_fake_{hexid}"),
+            }),
+        };
+        let external_data = card_external_data(req.provider, &details)
+            .context("fake gateway card details are incomplete")?;
+        self.ids
+            .lock()
+            .unwrap()
+            .insert(req.payment_id.clone(), format!("gw{hexid}"));
+        self.cards.lock().unwrap().push(req);
+        Ok(GatewayCardAttempt {
+            external_id: format!("{GATEWAY_EXTERNAL_ID_PREFIX}gw{hexid}"),
+            external_data,
+        })
     }
 
     async fn charge_saved_method(&self, req: GatewaySavedCharge) -> Result<GatewayCharge> {
