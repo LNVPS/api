@@ -307,6 +307,14 @@ credits it exactly once.
 
 Set `enabled: false` to switch screening off entirely.
 
+Lists and licences: the OFAC Specially Designated Nationals list is a work of the
+US government and in the public domain. The EU consolidated list of persons,
+groups and entities subject to EU financial sanctions is published by the
+European Commission and may be reused under Commission Decision 2011/833/EU,
+with acknowledgement of the source. Neither needs a key or an account. A paid
+provider (Chainalysis, Elliptic) can replace them by implementing
+`lnvps_api_common::sanctions::SanctionsProvider`.
+
 ### DNS — Cloudflare (optional)
 
 ```yaml
